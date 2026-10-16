@@ -9,6 +9,7 @@
    [app.common.data :as d]
    [app.common.data.macros :as dm]
    [app.common.exceptions :as ex]
+   [app.common.files.changes-builder :as pcb]
    [app.common.files.helpers :as cfh]
    [app.common.files.repair :as cfr]
    [app.common.files.validate :as cfv]
@@ -28,6 +29,7 @@
    [app.main.data.common :as dcm]
    [app.main.data.dashboard.shortcuts]
    [app.main.data.helpers :as dsh]
+   [app.main.data.persistence :as dps]
    [app.main.data.preview :as dp]
    [app.main.data.viewer.shortcuts]
    [app.main.data.workspace :as dw]
@@ -613,6 +615,86 @@
 (defn ^:export set-shape-ref
   [id shape-ref]
   (st/emit! (set-shape-ref* id shape-ref)))
+
+(def ^:private invalid-change-kinds
+  "Ways to break a page objects map so the backend validation rejects the
+  commit, with the validation error each one raises."
+  {"parent" {:code  :parent-not-found
+             :break (fn [objects shape]
+                      (assoc-in objects [(:id shape) :parent-id] (uuid/next)))}
+   "child"  {:code  :child-not-found
+             :break (fn [objects shape]
+                      (update-in objects [(:parent-id shape) :shapes] conj (uuid/next)))}})
+
+(defn- changed-ids
+  [objects objects']
+  (into [] (remove #(identical? (get objects %) (get objects' %))) (keys objects')))
+
+(defn- commit-objects-change
+  "Commits the shapes that differ between `objects` and `objects'`, with
+  the undo changes that restore them."
+  [origin page-id objects objects']
+  (-> (pcb/empty-changes origin page-id)
+      (pcb/with-objects objects)
+      (pcb/update-shapes (changed-ids objects objects') #(get objects' (:id %)))
+      (dwc/commit-changes)))
+
+(defn ^:export commitInvalidChange
+  "Commits a change that the backend validation rejects, on the selected
+  shape or, with nothing selected, the first shape of the page. Renames of
+  the same shape can be committed before and after it, so one save carries
+  valid commits around the invalid one. The batch is saved at once.
+
+  Kinds: 'parent' (the shape points to a missing parent, the default) and
+  'child' (its parent lists a missing child).
+
+  debug.commitInvalidChange()
+  debug.commitInvalidChange({kind: 'child', before: 2, after: 1})"
+  ([] (commitInvalidChange nil))
+  ([options]
+   (let [{:keys [kind before after]
+          :or {kind "parent" before 0 after 0}} (js->clj options :keywordize-keys true)
+
+         state    @st/state
+         objects  (dsh/lookup-page-objects state)
+         shape-id (or (first (dm/get-in state [:workspace-local :selected]))
+                      (first (dm/get-in objects [uuid/zero :shapes])))
+         shape    (get objects shape-id)
+         {:keys [code break]} (get invalid-change-kinds kind)]
+
+     (cond
+       (nil? break)
+       (str "unknown kind " kind ", expected one of "
+            (str/join ", " (keys invalid-change-kinds)))
+
+       (nil? shape)
+       "select a shape, or open a page that has one"
+
+       :else
+       (let [rename (fn [label]
+                      #(assoc-in % [shape-id :name] (str (:name shape) " [" label "]")))
+             steps  (concat (map #(rename (str "before " (inc %))) (range before))
+                            [#(break % shape)]
+                            (map #(rename (str "after " (inc %))) (range after)))]
+         (st/emit!
+          (ptk/reify ::commit-invalid-change
+            ptk/WatchEvent
+            (watch [it state _]
+              (let [page-id (:current-page-id state)
+                    commits (->> steps
+                                 (reduce (fn [[objects commits] step]
+                                           (let [objects' (step objects)]
+                                             [objects' (conj commits (commit-objects-change it page-id objects objects'))]))
+                                         [(dsh/lookup-page-objects state) []])
+                                 (second))]
+                (rx/concat
+                 (rx/from commits)
+                 ;; Lets every commit reach the persistence buffer first,
+                 ;; so the whole batch goes in one save.
+                 (->> (rx/timer 100)
+                      (rx/map (constantly ::dps/force-persist))))))))
+         (str "committed " (+ before 1 after) " changes on '" (:name shape)
+              "'; commit " (inc before) " should fail with " (name code)))))))
 
 (defn ^:export network-averages
   []
