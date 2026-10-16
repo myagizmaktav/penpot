@@ -67,19 +67,36 @@
    [:changes-with-metadata {:optional true}
     [:vector [:map
               [:changes [:vector cpc/schema:change]]
+              [:commit-id {:optional true} ::sm/uuid]
               [:hint-origin {:optional true} :keyword]
               [:hint-events {:optional true} [:vector [:string {:max 250}]]]]]]
    [:skip-validate {:optional true} ::sm/boolean]])
 
 (def ^:private
   schema:update-file-result
-  [:vector {:title "update-file-result"}
-   [:map
-    [:changes [:vector cpc/schema:change]]
-    [:file-id ::sm/uuid]
-    [:id ::sm/uuid]
-    [:revn {:min 0} ::sm/int]
-    [:session-id ::sm/uuid]]])
+  [:map {:title "update-file-result"}
+   ;; The revision the file had before this update
+   [:revn {:min 0} ::sm/int]
+   ;; Every change stored after the incoming revision, this one included
+   [:lagged
+    [:vector
+     [:map
+      [:changes [:vector cpc/schema:change]]
+      [:file-id ::sm/uuid]
+      [:id ::sm/uuid]
+      [:revn {:min 0} ::sm/int]
+      [:session-id ::sm/uuid]]]]
+   ;; Commits not saved: the first one that failed and every later one
+   [:rejected {:optional true}
+    [:map
+     [:commit-ids [:vector ::sm/uuid]]
+     [:failed-commit-id ::sm/uuid]
+     [:error
+      [:map
+       [:type :keyword]
+       [:code {:optional true} [:maybe :keyword]]
+       [:hint {:optional true} [:maybe :string]]
+       [:details {:optional true} [:vector :any]]]]]]])
 
 ;; --- HELPERS
 
@@ -161,12 +178,19 @@
                    (->> changes-with-metadata (mapcat :changes) vec)
                    (vec changes))
 
+        ;; Commits that are accepted or rejected one by one; without
+        ;; commit ids the whole request is accepted or rejected.
+        commits  (when (and (seq changes-with-metadata)
+                            (every? :commit-id changes-with-metadata))
+                   changes-with-metadata)
+
         params   (-> params
                      (assoc :profile-id profile-id)
                      (assoc :features (set/difference features cfeat/frontend-only-features))
                      (assoc :team team)
                      (assoc :file file)
-                     (assoc :changes changes))
+                     (assoc :changes changes)
+                     (assoc :commits commits))
 
         cfg      (assoc cfg ::timestamp (ct/now)
                         ::validation-timings (atom {}))
@@ -253,7 +277,7 @@
 
   Only intended for internal use on this module."
   [{:keys [::db/conn ::timestamp] :as cfg}
-   {:keys [profile-id file team features changes session-id skip-validate] :as params}]
+   {:keys [profile-id file team features changes commits session-id skip-validate] :as params}]
 
   (binding [pmap/*tracked* (pmap/create-tracked)
             pmap/*load-fn* (partial fdata/load-pointer cfg (:id file))]
@@ -272,47 +296,59 @@
                     cfeat/*previous* (:features file)]
             (update-file-data! cfg file
                                process-changes-and-validate
-                               changes skip-validate))
+                               changes commits skip-validate))
+
+          ;; Only the accepted changes are stored and broadcast
+          changes  (::changes file)
+          rejected (::rejected file)
+          params   (assoc params :changes changes)
+          file     (dissoc file ::changes ::rejected)
+
+          ;; A request whose first commit is rejected leaves the file as is
+          saved?   (or (nil? rejected) (seq changes))
 
           deleted-at
           (ct/plus timestamp (ct/duration {:hours 1}))]
 
-      (when-let [file (::snapshot file)]
-        (let [deleted-at (ct/plus timestamp (ldel/get-deletion-delay team))
-              label      (str "internal/snapshot/" revn)]
+      (when saved?
+        (when-let [file (::snapshot file)]
+          (let [deleted-at (ct/plus timestamp (ldel/get-deletion-delay team))
+                label      (str "internal/snapshot/" revn)]
 
-          (fsnap/create! cfg file
-                         {:label label
-                          :created-by "system"
-                          :deleted-at deleted-at
-                          :profile-id profile-id
-                          :session-id session-id})))
+            (fsnap/create! cfg file
+                           {:label label
+                            :created-by "system"
+                            :deleted-at deleted-at
+                            :profile-id profile-id
+                            :session-id session-id})))
 
-      ;; Insert change (xlog) with deleted_at in a future data for
-      ;; make them automatically eleggible for GC once they expires
-      (db/insert! conn :file-change
-                  {:id (uuid/next)
-                   :session-id session-id
-                   :profile-id profile-id
-                   :created-at timestamp
-                   :updated-at timestamp
-                   :deleted-at deleted-at
-                   :file-id (:id file)
-                   :revn (:revn file)
-                   :version (:version file)
-                   :features (into-array (:features file))
-                   :changes (blob/encode changes)}
-                  {::db/return-keys false})
+        ;; Insert change (xlog) with deleted_at in a future data for
+        ;; make them automatically eleggible for GC once they expires
+        (db/insert! conn :file-change
+                    {:id (uuid/next)
+                     :session-id session-id
+                     :profile-id profile-id
+                     :created-at timestamp
+                     :updated-at timestamp
+                     :deleted-at deleted-at
+                     :file-id (:id file)
+                     :revn (:revn file)
+                     :version (:version file)
+                     :features (into-array (:features file))
+                     :changes (blob/encode changes)}
+                    {::db/return-keys false})
 
-      (persist-file! cfg file)
+        (persist-file! cfg file)
 
-      (when (contains? cf/flags :redis-cache)
-        (invalidate-caches! cfg file))
+        (when (contains? cf/flags :redis-cache)
+          (invalidate-caches! cfg file))
 
-      ;; Send asynchronous notifications
-      (send-notifications! cfg params file)
+        ;; Send asynchronous notifications
+        (send-notifications! cfg params file))
 
-      (with-meta {:revn revn :lagged (get-lagged-changes conn params)}
+      (with-meta (cond-> {:revn revn :lagged (get-lagged-changes conn params)}
+                   (some? rejected)
+                   (assoc :rejected rejected))
         {::audit/replace-props
          {:id          (:id file)
           :name        (:name file)
@@ -324,7 +360,7 @@
           ;; `modified-at` mirrors `persist-file!`: same `::timestamp`
           ;; fallback, so both agree to the millisecond when the
           ;; request timestamp exists.
-          :revn        (:revn file)
+          :revn        (if saved? (:revn file) revn)
           :modified-at (or timestamp (ct/now))}}))))
 
 (defn get-file
@@ -434,23 +470,163 @@
       (l/error :hint "file validation error"
                :cause cause))))
 
+(defmacro ^:private with-validation-timing
+  "Runs `body` and records its time as the validation step `step-key`
+  (`step-label` in the metric), also when it throws."
+  [cfg step-key step-label & body]
+  `(let [t# (ct/tpoint)]
+     (try
+       ~@body
+       (finally
+         (record-validation-timing ~cfg ~step-key ~step-label (inst-ms (t#)))))))
+
+(defn- validate-file-schema
+  [cfg file skip-validate]
+  (binding [pmap/*tracked* nil]
+    (when (contains? cf/flags :soft-file-schema-validation)
+      (with-validation-timing cfg :soft-validate-schema-ms "soft-validate-schema"
+        (soft-validate-file-schema! file)))
+
+    (when (and (contains? cf/flags :file-schema-validation)
+               (not skip-validate))
+      (with-validation-timing cfg :validate-schema-ms "validate-schema"
+        (val/validate-file-schema! file)))))
+
+(defn- validate-file
+  "Validates the referential integrity of the entities affected by
+  `changes` and, with `schema?`, the schema of the whole file."
+  [cfg file libs changes skip-validate schema?]
+  (binding [pmap/*tracked* nil]
+    (when (contains? cf/flags :soft-file-validation)
+      (with-validation-timing cfg :soft-validate-affected-ms "soft-validate-affected"
+        (soft-validate-file! file libs changes)))
+
+    (when (and (contains? cf/flags :file-validation)
+               (not skip-validate))
+      (with-validation-timing cfg :validate-affected-ms "validate-affected"
+        (val/validate-file-affected! file libs changes))))
+
+  (when schema?
+    (validate-file-schema cfg file skip-validate)))
+
+(defn- apply-changes
+  "Applies `changes` to the file data and validates the file against
+  `validated-changes`, the changes whose affected entities are checked."
+  [cfg file libs changes validated-changes skip-validate schema?]
+  (let [file (with-validation-timing cfg :process-changes-ms "process-changes"
+               (update file :data (fn [data]
+                                    (-> data
+                                        (cpc/process-changes changes)
+                                        (d/without-nils)))))]
+    (validate-file cfg file libs validated-changes skip-validate schema?)
+    file))
+
+(defn- infrastructure-error?
+  [cause]
+  (some (fn [cause]
+          (or (instance? java.sql.SQLException cause)
+              (instance? java.io.IOException cause)
+              (instance? InterruptedException cause)
+              ;; A file fragment that cannot be loaded
+              (= :not-found (:type (ex-data cause)))))
+        (take-while some? (iterate ex-cause cause))))
+
+(defn- change-failure?
+  "True when `cause` comes from applying or validating changes, and not from
+  the database, the network, a missing fragment or the JVM. Only a change
+  failure rejects a commit; anything else fails the whole request."
+  [cause]
+  (and (or (instance? Exception cause)
+           (instance? AssertionError cause))
+       (not (infrastructure-error? cause))))
+
+(defn- rejection
+  "Describes the rejection of `commits`, the first of which failed with
+  `cause`."
+  [commits cause]
+  (let [data (ex-data cause)]
+    {:commit-ids       (mapv :commit-id commits)
+     :failed-commit-id (:commit-id (first commits))
+     :error            (if data
+                         (cond-> {:type (:type data)
+                                  :code (:code data)
+                                  :hint (or (:hint data) (ex-message cause))}
+                           (:details data)
+                           (assoc :details (mapv #(dissoc % :shape) (:details data))))
+                         {:type :internal
+                          :code :unexpected-error
+                          :hint (or (ex-message cause) (.getName (class cause)))})}))
+
+(defn- apply-commits
+  "Applies `commits` one at a time and keeps every commit before the first
+  one that fails. Each commit is validated together with the commits
+  accepted before it, which checks the same entities as validating them
+  all at once; with `schema?` the whole file schema is checked after each
+  commit too. The returned file carries the accepted changes under
+  `::changes` and, when a commit failed, its rejection under `::rejected`."
+  [cfg file libs commits skip-validate state schema?]
+  (loop [file     file
+         accepted []
+         commits  commits]
+    (if-let [{:keys [commit-id changes]} (first commits)]
+      (let [tracked   @pmap/*tracked*
+            refs      @state
+            accepted' (into accepted changes)
+            result    (try
+                        (apply-changes cfg file libs changes accepted' skip-validate schema?)
+                        (catch Throwable cause
+                          (when-not (change-failure? cause)
+                            (throw cause))
+                          cause))]
+        (if (instance? Throwable result)
+          (do
+            ;; Forget the fragments and media refs of the failed commit
+            (reset! pmap/*tracked* tracked)
+            (reset! state refs)
+            (l/error :hint "update-file commit rejected"
+                     :file-id (str (:id file))
+                     :commit-id (str commit-id)
+                     :rejected (count commits)
+                     :cause result)
+            (assoc file
+                   ::changes accepted
+                   ::rejected (rejection commits result)))
+          (recur result accepted' (rest commits))))
+      (assoc file ::changes accepted))))
+
+(defn- apply-commits-and-validate
+  "Applies `commits` one at a time checking only referential integrity, then
+  checks the schema of the result once. When that check fails, applies them
+  again from `file` checking the schema after each commit, to find the one
+  that breaks it. `tracked` is the pointer tracking to start again from."
+  [cfg file libs commits skip-validate state tracked]
+  (let [result (apply-commits cfg file libs commits skip-validate state false)]
+    (if (empty? (::changes result))
+      result
+      (try
+        (validate-file-schema cfg result skip-validate)
+        result
+        (catch Throwable cause
+          (when-not (change-failure? cause)
+            (throw cause))
+          (reset! pmap/*tracked* tracked)
+          (reset! state {})
+          (apply-commits cfg file libs commits skip-validate state true))))))
+
 (defn- process-changes-and-validate
-  [cfg file changes skip-validate]
+  "Applies and validates all `changes` at once. When that fails and the
+  request carries `commits`, applies them again one at a time from the
+  original data to keep the commits before the failing one."
+  [cfg file changes commits skip-validate]
   (let [should-resolve-libs?
         (and (or (contains? cf/flags :file-validation)
                  (contains? cf/flags :soft-file-validation))
              (not skip-validate))
 
-        tlibs
-        (ct/tpoint)
-
         libs
-        (try
-          (when should-resolve-libs?
-            (bfc/get-resolved-file-libraries cfg file))
-          (finally
-            (when should-resolve-libs?
-              (record-validation-timing cfg :resolve-libs-ms "resolve-libs" (inst-ms (tlibs))))))
+        (when should-resolve-libs?
+          (with-validation-timing cfg :resolve-libs-ms "resolve-libs"
+            (bfc/get-resolved-file-libraries cfg file)))
 
         ;; The main purpose of this atom is provide a contextual state
         ;; for the changes subsystem where optionally some hints can
@@ -460,58 +636,30 @@
         state
         (atom {})
 
-        tproc
-        (ct/tpoint)
+        file
+        (-> (files/check-version! file)
+            (update :revn inc))
+
+        tracked
+        @pmap/*tracked*
 
         file
-        (try
-          (let [file
-                (binding [cpc/*state* state]
-                  (-> (files/check-version! file)
-                      (update :revn inc)
-                      (update :data cpc/process-changes changes)
-                      (update :data d/without-nils)))
-
-                file
-                (if-let [media-refs (-> @state :media-refs not-empty)]
-                  (bfc/update-media-references! cfg file media-refs)
-                  file)]
-            file)
-          (finally
-            (record-validation-timing cfg :process-changes-ms "process-changes" (inst-ms (tproc)))))]
-
-    (binding [pmap/*tracked* nil]
-      (when (contains? cf/flags :soft-file-validation)
-        (let [t (ct/tpoint)]
+        (binding [cpc/*state* state]
           (try
-            (soft-validate-file! file libs changes)
-            (finally
-              (record-validation-timing cfg :soft-validate-affected-ms "soft-validate-affected" (inst-ms (t)))))))
+            (-> (apply-changes cfg file libs changes changes skip-validate true)
+                (assoc ::changes changes))
+            (catch Throwable cause
+              (when-not (and (some? commits)
+                             (change-failure? cause))
+                (throw cause))
+              ;; Forget the fragments and media refs of the failed attempt
+              (reset! pmap/*tracked* tracked)
+              (reset! state {})
+              (apply-commits-and-validate cfg file libs commits skip-validate state tracked))))]
 
-      (when (contains? cf/flags :soft-file-schema-validation)
-        (let [t (ct/tpoint)]
-          (try
-            (soft-validate-file-schema! file)
-            (finally
-              (record-validation-timing cfg :soft-validate-schema-ms "soft-validate-schema" (inst-ms (t)))))))
-
-      (when (and (contains? cf/flags :file-validation)
-                 (not skip-validate))
-        (let [t (ct/tpoint)]
-          (try
-            (val/validate-file-affected! file libs changes)
-            (finally
-              (record-validation-timing cfg :validate-affected-ms "validate-affected" (inst-ms (t)))))))
-
-      (when (and (contains? cf/flags :file-schema-validation)
-                 (not skip-validate))
-        (let [t (ct/tpoint)]
-          (try
-            (val/validate-file-schema! file)
-            (finally
-              (record-validation-timing cfg :validate-schema-ms "validate-schema" (inst-ms (t))))))))
-
-    file))
+    (if-let [media-refs (-> @state :media-refs not-empty)]
+      (bfc/update-media-references! cfg file media-refs)
+      file)))
 
 (defn- take-snapshot?
   "Defines the rule when file `data` snapshot should be saved."

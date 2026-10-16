@@ -16,6 +16,7 @@
    [app.common.uuid :as uuid]
    [app.main.data.event :as ev]
    [app.main.data.helpers :as dsh]
+   [app.main.data.workspace :as-alias dw]
    [app.main.features :as features]
    [app.main.worker :as mw]
    [app.render-wasm.api :as wasm.api]
@@ -212,6 +213,46 @@
               (->> (rx/from pending)
                    (rx/map (fn [commit] (update-indexes commit :redo-changes)))))
              (rx/of (update-indexes commit :redo-changes)))))))))
+
+(defn rebase-commits
+  "Rewrites the local data of the file `file-id`: undoes the commits in
+  `undo`, applies the `remote` changes, then redoes the commits in `redo`
+  (commits given oldest first). It is not a commit: nothing is saved,
+  broadcast or added to the undo history. When the changes cannot be
+  applied, the file is loaded again from the server."
+  [file-id {:keys [undo remote redo]}]
+  (let [commit  {:file-id file-id
+                 :redo-changes (-> []
+                                   (into (mapcat :undo-changes) (reverse undo))
+                                   (into remote)
+                                   (into (mapcat :redo-changes) redo))}
+        event   (apply-changes-localy commit nil)
+        failed? (volatile! false)]
+    (ptk/reify ::rebase-commits
+      ptk/UpdateEvent
+      (update [_ state]
+        (if (dsh/lookup-file-data state file-id)
+          (try
+            (ptk/update event state)
+            (catch :default cause
+              (log/error :hint "unable to rebase commits" :file-id (str file-id) :cause cause)
+              (vreset! failed? true)
+              state))
+          state))
+
+      ptk/WatchEvent
+      (watch [_ state stream]
+        (cond
+          @failed?
+          (rx/of (ptk/event ::dw/reload-current-file))
+
+          (dsh/lookup-file-data state file-id)
+          (rx/merge
+           (or (ptk/watch event state stream) (rx/empty))
+           (rx/of (update-indexes commit :redo-changes)))
+
+          :else
+          (rx/empty))))))
 
 (defn- resolve-file-revn
   [state file-id]

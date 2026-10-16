@@ -15,6 +15,8 @@
    [app.common.files.validate :as cfv]
    [app.common.json :as json]
    [app.common.logging :as l]
+   [app.common.logic.libraries :as cll]
+   [app.common.path-names :as cpn]
    [app.common.pprint :as pp]
    [app.common.render-wasm.helpers :as wasm.h]
    [app.common.render-wasm.mem :as wasm.mem]
@@ -630,14 +632,38 @@
   [objects objects']
   (into [] (remove #(identical? (get objects %) (get objects' %))) (keys objects')))
 
+(defn- renamed-main-instances
+  "Main instances whose name differs between `objects` and `objects'`."
+  [objects objects']
+  (into []
+        (comp (map #(get objects' %))
+              (filter ctk/main-instance?)
+              (remove #(= (:name %) (:name (get objects (:id %))))))
+        (changed-ids objects objects')))
+
+(defn- rename-components
+  "`data` with the component of each renamed main instance in `objects'`
+  named like it."
+  [data objects objects']
+  (reduce (fn [data {:keys [component-id name]}]
+            (let [[path name] (cpn/split-group-name name)]
+              (update-in data [:components component-id] assoc :path path :name name)))
+          data
+          (renamed-main-instances objects objects')))
+
 (defn- commit-objects-change
   "Commits the shapes that differ between `objects` and `objects'`, with
-  the undo changes that restore them."
-  [origin page-id objects objects']
-  (-> (pcb/empty-changes origin page-id)
-      (pcb/with-objects objects)
-      (pcb/update-shapes (changed-ids objects objects') #(get objects' (:id %)))
-      (dwc/commit-changes)))
+  the undo changes that restore them. A renamed main instance renames its
+  component in the same commit (`data` holds the components before it), as
+  the validation requires both names to match."
+  [origin page-id data objects objects']
+  (dwc/commit-changes
+   (reduce (fn [changes {:keys [component-id name]}]
+             (cll/generate-rename-component changes component-id name data))
+           (-> (pcb/empty-changes origin page-id)
+               (pcb/with-objects objects)
+               (pcb/update-shapes (changed-ids objects objects') #(get objects' (:id %))))
+           (renamed-main-instances objects objects'))))
 
 (defn ^:export commitInvalidChange
   "Commits a change that the backend validation rejects, on the selected
@@ -682,16 +708,20 @@
             (watch [it state _]
               (let [page-id (:current-page-id state)
                     commits (->> steps
-                                 (reduce (fn [[objects commits] step]
+                                 (reduce (fn [[data objects commits] step]
                                            (let [objects' (step objects)]
-                                             [objects' (conj commits (commit-objects-change it page-id objects objects'))]))
-                                         [(dsh/lookup-page-objects state) []])
-                                 (second))]
+                                             [(rename-components data objects objects')
+                                              objects'
+                                              (conj commits (commit-objects-change it page-id data objects objects'))]))
+                                         [(dsh/lookup-file-data state) (dsh/lookup-page-objects state) []])
+                                 (last))]
                 (rx/concat
                  (rx/from commits)
-                 ;; Lets every commit reach the persistence buffer first,
-                 ;; so the whole batch goes in one save.
-                 (->> (rx/timer 100)
+                 ;; Lets every commit reach the persistence buffer first, so
+                 ;; the whole batch goes in one save, and waits past the
+                 ;; pending-status debounce (200ms), which would otherwise
+                 ;; land after the save and leave the status pending.
+                 (->> (rx/timer 300)
                       (rx/map (constantly ::dps/force-persist))))))))
          (str "committed " (+ before 1 after) " changes on '" (:name shape)
               "'; commit " (inc before) " should fail with " (name code)))))))
