@@ -664,7 +664,8 @@
                                           :file-id (str file-id)
                                           :deleted-at (ct/format-inst deleted-at))
 
-                                   (let [affected (-> (db/delete! conn :file-change {:id id})
+                                   (let [affected (-> (db/delete! conn :file-change
+                                                                  {:id id :file-id file-id})
                                                       (db/get-update-count))]
                                      (+ total affected)))
                                  0)))))

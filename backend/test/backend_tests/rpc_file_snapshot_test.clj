@@ -220,3 +220,66 @@
         ;; (th/print-result! out)
         (t/is (nil? (:error out)))
         (t/is (true? (:result out)))))))
+
+(t/deftest snapshots-crud-without-file-id
+  ;; The snapshot RPC commands accept an optional `file-id` parameter (used
+  ;; for partition pruning on the `file_change` table). Commands must keep
+  ;; working without it, as older clients do not send it.
+  (let [profile (th/create-profile* 1 {:is-active true})
+        team-id (:default-team-id profile)
+        proj-id (:default-project-id profile)
+
+        file    (th/create-file* 1 {:profile-id (:id profile)
+                                    :project-id proj-id
+                                    :is-shared false})
+
+        snapshot
+        (let [params {::th/type :create-file-snapshot
+                      ::rpc/profile-id (:id profile)
+                      :file-id (:id file)
+                      :label "label1"}
+              out    (th/command! params)]
+          ;; (th/print-result! out)
+
+          (t/is (nil? (:error out)))
+          (:result out))]
+
+    (t/testing "update snapshot without file-id"
+      (let [params {::th/type :update-file-snapshot
+                    ::rpc/profile-id (:id profile)
+                    :id (:id snapshot)
+                    :label "label2"}
+            out    (th/command! params)]
+        ;; (th/print-result! out)
+        (t/is (nil? (:error out)))
+        (t/is (true? (:result out)))))
+
+    (t/testing "lock snapshot without file-id"
+      (let [params {::th/type :lock-file-snapshot
+                    ::rpc/profile-id (:id profile)
+                    :id (:id snapshot)}
+            out    (th/command! params)]
+        ;; (th/print-result! out)
+        (t/is (nil? (:error out)))
+        (t/is (true? (:result out)))))
+
+    (t/testing "unlock snapshot without file-id"
+      (let [params {::th/type :unlock-file-snapshot
+                    ::rpc/profile-id (:id profile)
+                    :id (:id snapshot)}
+            out    (th/command! params)]
+        ;; (th/print-result! out)
+        (t/is (nil? (:error out)))
+        (t/is (true? (:result out)))))
+
+    (t/testing "delete snapshot without file-id"
+      (let [params {::th/type :delete-file-snapshot
+                    ::rpc/profile-id (:id profile)
+                    :id (:id snapshot)}
+            out    (th/command! params)]
+        ;; (th/print-result! out)
+        (t/is (nil? (:error out)))
+        (t/is (true? (:result out))))
+
+      ;; process the delete-object task enqueued by the snapshot delete
+      (th/run-pending-tasks!))))
