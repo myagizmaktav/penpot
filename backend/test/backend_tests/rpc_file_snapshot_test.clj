@@ -234,10 +234,10 @@
         (t/is (nil? (:error out)))
         (t/is (true? (:result out)))))))
 
-(t/deftest snapshots-crud-without-file-id
-  ;; The snapshot RPC commands accept an optional `file-id` parameter (used
-  ;; for partition pruning on the `file_change` table). Commands must keep
-  ;; working without it, as older clients do not send it.
+(t/deftest snapshots-require-file-id
+  ;; Since version 2.19 the snapshot commands require the `file-id`
+  ;; parameter, so partition pruning can always be applied on the
+  ;; `file_change` table.
   (let [profile (th/create-profile* 1 {:is-active true})
         team-id (:default-team-id profile)
         proj-id (:default-project-id profile)
@@ -257,52 +257,17 @@
           (t/is (nil? (:error out)))
           (:result out))]
 
-    (t/testing "update snapshot without file-id"
-      (let [params {::th/type :update-file-snapshot
-                    ::rpc/profile-id (:id profile)
-                    :id (:id snapshot)
-                    :label "label2"}
+    (doseq [type [:update-file-snapshot :lock-file-snapshot
+                  :unlock-file-snapshot :delete-file-snapshot]]
+      (let [params (merge {::th/type type
+                           ::rpc/profile-id (:id profile)
+                           :id (:id snapshot)}
+                          (when (= type :update-file-snapshot)
+                            {:label "label2"}))
             out    (th/command! params)]
-        ;; (th/print-result! out)
-        (t/is (nil? (:error out)))
-        (t/is (true? (:result out)))
-        (t/is (= "label2"
-                 (:label (th/db-get :file-change {:id (:id snapshot)}))))))
 
-    (t/testing "lock snapshot without file-id"
-      (let [params {::th/type :lock-file-snapshot
-                    ::rpc/profile-id (:id profile)
-                    :id (:id snapshot)}
-            out    (th/command! params)]
-        ;; (th/print-result! out)
-        (t/is (nil? (:error out)))
-        (t/is (true? (:result out)))
-        (t/is (= (:id profile)
-                 (:locked-by (th/db-get :file-change {:id (:id snapshot)}))))))
-
-    (t/testing "unlock snapshot without file-id"
-      (let [params {::th/type :unlock-file-snapshot
-                    ::rpc/profile-id (:id profile)
-                    :id (:id snapshot)}
-            out    (th/command! params)]
-        ;; (th/print-result! out)
-        (t/is (nil? (:error out)))
-        (t/is (true? (:result out)))
-        (t/is (nil? (:locked-by (th/db-get :file-change {:id (:id snapshot)}))))))
-
-    (t/testing "delete snapshot without file-id"
-      (let [params {::th/type :delete-file-snapshot
-                    ::rpc/profile-id (:id profile)
-                    :id (:id snapshot)}
-            out    (th/command! params)]
-        ;; (th/print-result! out)
-        (t/is (nil? (:error out)))
-        (t/is (true? (:result out)))
-        (t/is (some? (:deleted-at (th/db-get :file-change {:id (:id snapshot)}
-                                             {::db/remove-deleted false})))))
-
-      ;; process the delete-object task enqueued by the snapshot delete
-      (th/run-pending-tasks!))))
+        (t/testing (str (name type) " without file-id")
+          (t/is (th/ex-of-code? (:error out) :params-validation)))))))
 
 (t/deftest snapshots-reject-a-file-id-that-does-not-match
   ;; The snapshot commands filter by `file_id` so that, once `file_change` is

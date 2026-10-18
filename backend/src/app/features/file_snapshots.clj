@@ -93,26 +93,17 @@
   (str "WITH snapshots AS (" sql:snapshots ")"
        "SELECT " sql:snapshot-columns
        " FROM snapshots AS c
-         WHERE c.id = ? " sql:snapshot-visible))
-
-(def ^:private sql:get-snapshot-without-data-with-file-id
-  (str "WITH snapshots AS (" sql:snapshots ")"
-       "SELECT " sql:snapshot-columns
-       " FROM snapshots AS c
          WHERE c.file_id = ?
            AND c.id = ? " sql:snapshot-visible))
 
 (defn get-minimal-snapshot
-  "Get the minimal snapshot info (without the data blob). When `file-id` is
-  provided the query filters also by `file_id`, which allows partition
-  pruning once `file_change` is partitioned by it. Raises `:snapshot-not-found`
-  when there is no matching snapshot."
+  "Get the minimal snapshot info (without the data blob). The query filters
+  by `file_id`, which allows partition pruning once `file_change` is
+  partitioned by it. Raises `:snapshot-not-found` when there is no matching
+  snapshot."
   [cfg file-id snapshot-id]
-  (let [now (ct/now)
-        sql (if (some? file-id)
-              [sql:get-snapshot-without-data-with-file-id file-id snapshot-id now]
-              [sql:get-snapshot-without-data snapshot-id now])]
-    (or (-> (db/get-with-sql cfg sql
+  (let [now (ct/now)]
+    (or (-> (db/get-with-sql cfg [sql:get-snapshot-without-data file-id snapshot-id now]
                              {::db/remove-deleted false
                               ::db/throw-if-not-exists false})
             (decode-snapshot))

@@ -151,12 +151,13 @@
 
 (def ^:private schema:update-file-snapshot
   [:map {:title "update-file-snapshot"}
-   [:file-id {:optional true} ::sm/uuid]
+   [:file-id ::sm/uuid]
    [:id ::sm/uuid]
    [:label ::sm/text]])
 
 (sv/defmethod ::update-file-snapshot
   {::doc/added "1.20"
+   ::doc/changes [["2.19" "The :file-id param is now required"]]
    ::sm/params schema:update-file-snapshot
    ::db/transaction true}
   [{:keys [::db/conn]} {:keys [::rpc/profile-id file-id id label]}]
@@ -166,11 +167,12 @@
 
 (def ^:private schema:remove-file-snapshot
   [:map {:title "remove-file-snapshot"}
-   [:file-id {:optional true} ::sm/uuid]
+   [:file-id ::sm/uuid]
    [:id ::sm/uuid]])
 
 (sv/defmethod ::delete-file-snapshot
   {::doc/added "1.20"
+   ::doc/changes [["2.19" "The :file-id param is now required"]]
    ::sm/params schema:remove-file-snapshot
    ::db/transaction true}
   [{:keys [::db/conn]} {:keys [::rpc/profile-id file-id id]}]
@@ -202,11 +204,12 @@
 
 (def ^:private schema:lock-file-snapshot
   [:map {:title "lock-file-snapshot"}
-   [:file-id {:optional true} ::sm/uuid]
+   [:file-id ::sm/uuid]
    [:id ::sm/uuid]])
 
 (sv/defmethod ::lock-file-snapshot
   {::doc/added "1.20"
+   ::doc/changes [["2.19" "The :file-id param is now required"]]
    ::sm/params schema:lock-file-snapshot
    ::db/transaction true}
   [{:keys [::db/conn]} {:keys [::rpc/profile-id file-id id]}]
@@ -242,11 +245,12 @@
 
 (def ^:private schema:unlock-file-snapshot
   [:map {:title "unlock-file-snapshot"}
-   [:file-id {:optional true} ::sm/uuid]
+   [:file-id ::sm/uuid]
    [:id ::sm/uuid]])
 
 (sv/defmethod ::unlock-file-snapshot
   {::doc/added "1.20"
+   ::doc/changes [["2.19" "The :file-id param is now required"]]
    ::sm/params schema:unlock-file-snapshot
    ::db/transaction  true}
   [{:keys [::db/conn]} {:keys [::rpc/profile-id file-id id]}]
