@@ -297,6 +297,40 @@
                       :type "fragment"
                       :data content})))))
 
+(defmacro with-pointers
+  "Bind the fragment loader for `file-id` around `body`. All pointer
+  derefs must happen inside the body; a pointer derefed outside of it
+  raises because there is no loader bound."
+  [cfg file-id & body]
+  `(binding [pmap/*load-fn* (partial load-pointer ~cfg ~file-id)]
+     ~@body))
+
+(defmacro with-tracked
+  "Bind a fresh tracked set around `body`, without a fragment loader.
+  For write paths that create pointers before any file exists to load
+  from (e.g. file creation): wrapping tracks new pointers for
+  persistence, while any deref still fails loudly."
+  [& body]
+  `(binding [pmap/*tracked* (pmap/create-tracked)]
+     ~@body))
+
+(defmacro with-untracked
+  "Run `body` with pointer tracking disabled. For validation passes
+   that must not track anything for persistence: pointers created
+   inside are not collected, and derefs still go through the bound
+   loader when there is one."
+  [& body]
+  `(binding [pmap/*tracked* nil]
+     ~@body))
+
+(defmacro with-tracked-pointers
+  "Bind a fresh tracked set plus the fragment loader for `file-id`
+  around `body`. For write paths that create or modify pointers."
+  [cfg file-id & body]
+  `(binding [pmap/*tracked* (pmap/create-tracked)
+             pmap/*load-fn* (partial load-pointer ~cfg ~file-id)]
+     ~@body))
+
 (defn process-pointers
   "Apply a function to all pointers on the file. Usuly used for
   dereference the pointer to a plain value before some processing."
@@ -316,7 +350,7 @@
   snapshot map carries the snapshot id, which would load the wrong
   fragments)."
   [cfg file-id data]
-  (binding [pmap/*load-fn* (partial load-pointer cfg file-id)]
+  (with-pointers cfg file-id
     (process-pointers data deref)))
 
 (defn realize-pointers
@@ -375,27 +409,3 @@
             data)
           cached)))))
 
-(defmacro with-pointers
-  "Bind the fragment loader for `file-id` around `body`. All pointer
-  derefs must happen inside the body; a pointer derefed outside of it
-  raises because there is no loader bound."
-  [cfg file-id & body]
-  `(binding [pmap/*load-fn* (partial load-pointer ~cfg ~file-id)]
-     ~@body))
-
-(defmacro with-tracked
-  "Bind a fresh tracked set around `body`, without a fragment loader.
-  For write paths that create pointers before any file exists to load
-  from (e.g. file creation): wrapping tracks new pointers for
-  persistence, while any deref still fails loudly."
-  [& body]
-  `(binding [pmap/*tracked* (pmap/create-tracked)]
-     ~@body))
-
-(defmacro with-tracked-pointers
-  "Bind a fresh tracked set plus the fragment loader for `file-id`
-  around `body`. For write paths that create or modify pointers."
-  [cfg file-id & body]
-  `(binding [pmap/*tracked* (pmap/create-tracked)
-             pmap/*load-fn* (partial load-pointer ~cfg ~file-id)]
-     ~@body))

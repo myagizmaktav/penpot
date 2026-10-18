@@ -316,3 +316,125 @@
                (fdata/get-used-pointer-ids
                 (:data (bfc/get-file th/*system* file-id)))))
       (t/is (some? (:data (fsnap/get-snapshot th/*system* file-id (:id snap))))))))
+
+(t/deftest gc-reattaches-unchanged-pages-and-marks-orphan
+  ;; No-churn boundary when content changes: modify exactly one page of
+  ;; a two-page file and run file-gc. Unmodified pages must keep their
+  ;; fragment ids (reattach), the replaced fragment must be marked, a
+  ;; follow-up objects-gc must purge only that row, and the live file
+  ;; must still resolve fully.
+  (let [profile (th/create-profile* 1)
+        file    (th/create-file* 1 {:profile-id (:id profile)
+                                    :project-id (:default-project-id profile)
+                                    :is-shared false})
+        file-id (:id file)
+        f0      (bfc/get-file th/*system* file-id)
+        page-1  (first (:pages (:data f0)))
+        page-2  (uuid/next)
+        shape-2 (uuid/random)]
+    ;; Second page so "unchanged" has a witness.
+    (update-file! :profile-id (:id profile)
+                  :file-id file-id
+                  :revn 0
+                  :changes [{:type :add-page
+                             :name "second"
+                             :id page-2}
+                            {:type :add-obj
+                             :page-id page-2
+                             :id shape-2
+                             :parent-id uuid/zero
+                             :frame-id uuid/zero
+                             :components-v2 true
+                             :obj (cts/setup-shape
+                                   {:id shape-2
+                                    :name "rect"
+                                    :frame-id uuid/zero
+                                    :parent-id uuid/zero
+                                    :type :rect})}])
+    (let [f1        (bfc/get-file th/*system* file-id)
+          pages-1   (:pages-index (:data f1))
+          id-1-before (pmap/get-id (get pages-1 page-1))
+          id-2-before (pmap/get-id (get pages-1 page-2))]
+      (t/is (some? id-1-before))
+      (t/is (some? id-2-before))
+      (t/is (not= id-1-before id-2-before))
+      ;; Modify exactly page-1.
+      (update-file! :profile-id (:id profile)
+                    :file-id file-id
+                    :revn 1
+                    :changes (add-rect-change page-1 (uuid/random)))
+      (let [f2          (bfc/get-file th/*system* file-id)
+            pages-2     (:pages-index (:data f2))
+            id-1-after  (pmap/get-id (get pages-2 page-1))
+            id-2-after  (pmap/get-id (get pages-2 page-2))
+            orphan      id-1-before]
+        (t/is (not= id-1-before id-1-after))
+        (t/is (= id-2-before id-2-after))
+        ;; Updates take automatic snapshots that would pin the orphan;
+        ;; drop them so it is really unreferenced (same cleanup the
+        ;; gc-marks test performs before asserting marking).
+        (th/db-delete! :file-change {:file-id file-id})
+        (th/db-delete! :file-data {:file-id file-id :type "snapshot"})
+        (t/is (true? (th/run-task! :file-gc {:file-id file-id})))
+        ;; Unchanged page kept its id through the pass.
+        (let [f3     (bfc/get-file th/*system* file-id)
+              pages-3 (:pages-index (:data f3))]
+          (t/is (= id-2-after (pmap/get-id (get pages-3 page-2)))))
+        ;; Orphan marked, nothing else touched.
+        (let [rows   (fragment-rows file-id)
+              marked (filter #(some? (:deleted-at %)) rows)]
+          (t/is (= 1 (count marked)))
+          (t/is (= orphan (:id (first marked)))))
+        ;; objects-gc purges exactly the orphan row.
+        (t/is (pos? (:processed (th/run-task! :objects-gc {}))))
+        (let [rows (fragment-rows file-id)]
+          (t/is (nil? (some #(= orphan (:id %)) rows)))
+          (t/is (= #{id-1-after id-2-after} (live-fragment-ids file-id))))
+        ;; Live file still resolves fully.
+        (let [live (:data (bfc/get-file th/*system* file-id :realize? true))]
+          (t/is (empty? (fdata/get-used-pointer-ids live))))))))
+
+(t/deftest snapshot-preview-resolves-after-offload
+  ;; The preview path must resolve fragments that now live in the
+  ;; storage backend, not just in db.
+  (let [profile (th/create-profile* 1)
+        file    (th/create-file* 1 {:profile-id (:id profile)
+                                    :project-id (:default-project-id profile)
+                                    :is-shared false})
+        file-id (:id file)
+        f0      (bfc/get-file th/*system* file-id)
+        snap    (fsnap/create! th/*system* f0 {:profile-id (:id profile)})]
+    (t/is (uuid? (:id snap)))
+    (update-file! :profile-id (:id profile)
+                  :file-id file-id
+                  :revn 0
+                  :changes (add-rect-change
+                            (first (:pages (:data f0)))
+                            (uuid/random)))
+    (let [result (th/run-task! :offload-file-data {:file-id file-id})]
+      (t/is (zero? (:skipped result)))
+      (t/is (pos? (:offloaded result))))
+    (let [out (th/command! {::th/type :get-file-snapshot
+                            ::rpc/profile-id (:id profile)
+                            :file-id file-id
+                            :id (:id snap)
+                            :features cfeat/supported-features})]
+      (t/is (nil? (:error out)))
+      (t/is (empty? (fdata/get-used-pointer-ids
+                     (get-in out [:result :data])))))))
+
+(t/deftest with-tracked-tracks-and-fails-loud-without-loader
+  ;; Direct pin of the with-tracked contract: wrapping tracks the new
+  ;; pointer, and a pointer that needs loading raises loudly because
+  ;; no loader is bound. (`wrap` carries its value inline so it
+  ;; derefs fine; `create` with an id starts unloaded, so it must
+  ;; load — and there is nothing to load from.)
+  (fdata/with-tracked
+    (let [wrapped  (pmap/wrap {:a 1})
+          unloaded (pmap/create (uuid/next) {})]
+      (t/is (pmap/pointer-map? wrapped))
+      (t/is (pmap/pointer-map? unloaded))
+      (t/is (contains? @pmap/*tracked* (pmap/get-id wrapped)))
+      (t/is (contains? @pmap/*tracked* (pmap/get-id unloaded)))
+      (t/is (= {:a 1} @wrapped))
+      (t/is (thrown? UnsupportedOperationException @unloaded)))))

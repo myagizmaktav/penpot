@@ -35,7 +35,6 @@
    [app.rpc.doc :as-alias doc]
    [app.rpc.helpers :as rph]
    [app.util.blob :as blob]
-   [app.util.pointer-map :as pmap]
    [app.util.services :as sv]
    [clojure.set :as set]))
 
@@ -423,7 +422,7 @@
           (bfc/update-media-references! cfg file media-refs)
           file)]
 
-    (binding [pmap/*tracked* nil]
+    (fdata/with-untracked
       (when (contains? cf/flags :soft-file-validation)
         (soft-validate-file! file libs changes))
 

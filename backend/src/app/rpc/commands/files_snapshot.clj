@@ -143,11 +143,19 @@
         file-revn (:revn file)]
 
     ;; Create backup snapshot of the current state (committed immediately
-    ;; independently of the restore outcome)
-    (fsnap/create! cfg file
-                   {:profile-id profile-id
-                    :deleted-at (ct/in-future delay)
-                    :created-by "system"})
+    ;; independent of the restore outcome). The read takes FOR SHARE so a
+    ;; concurrent :file-gc pass (which holds FOR UPDATE + SKIP LOCKED on the
+    ;; file row) either finishes first -- and we snapshot the new fragments --
+    ;; or skips the file and retries later. Without the lock, the backup
+    ;; could reference fragments the pass is about to mark as deleted,
+    ;; breaking the backup permanently.
+    (db/tx-run! cfg
+                (fn [cfg]
+                  (let [file (bfc/get-file cfg file-id :lock-for-share? true)]
+                    (fsnap/create! cfg file
+                                   {:profile-id profile-id
+                                    :deleted-at (ct/in-future delay)
+                                    :created-by "system"}))))
 
     ;; Restore snapshot inside its own transaction; the revn check
     ;; ensures no data is lost if the file was edited concurrently

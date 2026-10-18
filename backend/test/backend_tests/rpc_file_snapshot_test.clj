@@ -22,6 +22,7 @@
    [app.rpc :as-alias rpc]
    [app.storage :as sto]
    [backend-tests.helpers :as th]
+   [clojure.set :as set]
    [clojure.test :as t]
    [cuerdas.core :as str]))
 
@@ -172,7 +173,9 @@
                                     :parent-id uuid/zero
                                     :type :rect})}])
 
-    (let [snap-id (->> (th/db-query :file-change {:file-id file-id})
+    ;; Single labeled snapshot here, but order explicitly so a
+    ;; future edit adding more snapshots cannot pick the wrong one.
+    (let [snap-id (->> (th/db-query :file-change {:file-id file-id} {:order-by [:created-at]})
                        (filter #(some? (:label %)))
                        (first)
                        (:id))
@@ -440,7 +443,7 @@
       ;; The pinned snapshot (not an arbitrary autosnapshot: those may
       ;; reference fragments an earlier pass already marked) must keep
       ;; resolving after another GC cycle.
-      (let [snap-id (->> (th/db-query :file-change {:file-id file-id})
+      (let [snap-id (->> (th/db-query :file-change {:file-id file-id} {:order-by [:created-at]})
                          (filter #(= "pinned" (:label %)))
                          (first)
                          (:id))
@@ -453,3 +456,96 @@
         (t/is (nil? (:error out)))
         (t/is (empty? (fdata/get-used-pointer-ids
                        (get-in out [:result :data]))))))))
+
+(t/deftest restore-backup-serializes-with-file-gc
+  ;; The backup snapshot taken by restore shares fragment rows with
+  ;; the live file, so its creation must serialize with a concurrent
+  ;; :file-gc pass, like ::create-file-snapshot does: with FOR SHARE
+  ;; held by the GC pass, the restore waits at the locked read instead
+  ;; of snapshotting pre-GC fragment ids that the pass is about to
+  ;; mark as deleted.
+  (let [profile (th/create-profile* 1)
+        file    (th/create-file* 1 {:profile-id (:id profile)
+                                    :project-id (:default-project-id profile)
+                                    :is-shared false})
+        file-id (:id file)
+        page-id (first (get-in file [:data :pages]))
+        shape-id (uuid/random)
+        snap-id (:id (:result (th/command! {::th/type :create-file-snapshot
+                                            ::rpc/profile-id (:id profile)
+                                            :file-id file-id
+                                            :label "v1"})))]
+    (t/is (uuid? snap-id))
+    (update-file! :profile-id (:id profile)
+                  :file-id file-id
+                  :revn 0
+                  :changes [{:type :add-obj
+                             :page-id page-id
+                             :id shape-id
+                             :parent-id uuid/zero
+                             :frame-id uuid/zero
+                             :components-v2 true
+                             :obj (cts/setup-shape
+                                   {:id shape-id
+                                    :name "rect"
+                                    :frame-id uuid/zero
+                                    :parent-id uuid/zero
+                                    :type :rect})}])
+    (let [orig-reduce  @#'fsnap/reduce-snapshots
+          orig-create  @#'fsnap/create!
+          scan-started (promise)
+          release-scan (promise)
+          reached-insert (promise)
+          do-restore   (fn []
+                         (th/command! {::th/type :restore-file-snapshot
+                                       ::rpc/profile-id (:id profile)
+                                       :file-id file-id
+                                       :id snap-id}))]
+      (with-redefs [fsnap/reduce-snapshots
+                    (fn [cfg file-id xform f init]
+                      (deliver scan-started true)
+                      @release-scan
+                      (orig-reduce cfg file-id xform f init))
+                    fsnap/create!
+                    (fn [& args]
+                      (deliver reached-insert true)
+                      (apply orig-create args))]
+        (let [gc-done (future (th/run-task! :file-gc {:file-id file-id}))]
+          (t/is (= true (deref scan-started 10000 ::timeout)))
+          (let [restored (future (do-restore))]
+            (t/is (= ::timeout (deref reached-insert 10000 ::timeout)))
+            (deliver release-scan true)
+            (t/is (some? (deref gc-done 30000 ::timeout)))
+            (let [out (deref restored 30000 ::timeout)]
+              (t/is (not= ::timeout out))
+              (t/is (nil? (:error out))))))))
+    (let [backup-ids (->> (th/db-query :file-change {:file-id file-id})
+                          (map (juxt :id :label))
+                          (filter (fn [[_ label]]
+                                    (and (string? label)
+                                         (str/starts-with? label "snapshot-"))))
+                          (map first)
+                          (set))
+          backup-ids (set/intersection
+                      backup-ids
+                      (into #{}
+                            (map :id)
+                            (th/db-query :file-data {:file-id file-id
+                                                     :type "snapshot"})))
+          live       (into #{}
+                           (map :id)
+                           (filter #(nil? (:deleted-at %))
+                                   (th/db-query :file-data {:file-id file-id
+                                                            :type "fragment"})))]
+      (t/is (= 1 (count backup-ids)))
+      (doseq [backup-id backup-ids
+              :let [snap (fsnap/get-snapshot th/*system* file-id backup-id)]]
+        (t/is (every? live (fdata/get-used-pointer-ids (:data snap))))
+        (let [out (th/command! {::th/type :get-file-snapshot
+                                ::rpc/profile-id (:id profile)
+                                :file-id file-id
+                                :id backup-id
+                                :features cfeat/supported-features})]
+          (t/is (nil? (:error out)))
+          (t/is (empty? (fdata/get-used-pointer-ids
+                         (get-in out [:result :data])))))))))

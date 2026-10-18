@@ -280,7 +280,7 @@
 
   (assert (db/connection? conn) "expected cfg with valid connection")
   (when (and (not load-data?)
-             (or lock-for-share? lock-for-share? skip-locked?))
+             (or lock-for-share? lock-for-update? skip-locked?))
     (throw (IllegalArgumentException. "locking is incompatible when `load-data?` is false")))
 
   (let [sql

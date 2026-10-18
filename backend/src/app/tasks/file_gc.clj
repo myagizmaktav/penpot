@@ -304,7 +304,12 @@
 (defn- process-file!
   [cfg {:keys [file-id] :as props}]
   (if-let [file (get-file cfg props)]
-    (feat.fdata/with-pointers cfg file-id
+    ;; NOTE: like with-pointers, but with a per-pass memoized loader:
+    ;; cleaning, reattach and validation dereference every fragment
+    ;; several times, and fragments are immutable so caching them for
+    ;; the duration of the pass is always safe.
+    (binding [pmap/*load-fn* (feat.fdata/memoize-loader
+                              (partial feat.fdata/load-pointer cfg file-id))]
       (let [liveness (collect-snapshot-liveness cfg file-id)
             original (original-pointers (:data file))
             file (->> file
