@@ -332,10 +332,11 @@
                             {:label "label2"}))
             out    (th/command! params)]
 
-        (t/is (th/ex-info? (:error out)))
-        (t/is (= :not-found (:type (ex-data (:error out)))))
-        (t/is (= :snapshot-not-found (:code (ex-data (:error out)))))
-        (t/is (= "label1"
-                 (:label (th/db-get :file-change {:id (:id snapshot)}
-                                    {::db/remove-deleted false})))
-              "the snapshot of file-a stays intact")))))
+        (t/testing (name type)
+          (t/is (th/ex-info? (:error out)))
+          (t/is (= :not-found (:type (ex-data (:error out)))))
+          (t/is (= :snapshot-not-found (:code (ex-data (:error out)))))
+          (t/is (= "label1"
+                   (:label (th/db-get :file-change {:id (:id snapshot)}
+                                      {::db/remove-deleted false})))
+                "the snapshot of file-a stays intact"))))))

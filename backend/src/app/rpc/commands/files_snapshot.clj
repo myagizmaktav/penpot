@@ -161,12 +161,6 @@
    ::db/transaction true}
   [{:keys [::db/conn]} {:keys [::rpc/profile-id file-id id label]}]
   (let [snapshot (fsnap/get-minimal-snapshot conn file-id id)]
-    (when-not snapshot
-      (ex/raise :type :not-found
-                :code :snapshot-not-found
-                :hint "unable to find snapshot with the provided id"
-                :snapshot-id id
-                :file-id file-id))
     (files/check-edition-permissions! conn profile-id (:file-id snapshot))
     (fsnap/update! conn (assoc snapshot :label label))))
 
@@ -181,12 +175,6 @@
    ::db/transaction true}
   [{:keys [::db/conn]} {:keys [::rpc/profile-id file-id id]}]
   (let [snapshot (fsnap/get-minimal-snapshot conn file-id id)]
-    (when-not snapshot
-      (ex/raise :type :not-found
-                :code :snapshot-not-found
-                :hint "unable to find snapshot with the provided id"
-                :snapshot-id id
-                :file-id file-id))
     (files/check-edition-permissions! conn profile-id (:file-id snapshot))
 
     (when (not= (:created-by snapshot) "user")
@@ -223,12 +211,6 @@
    ::db/transaction true}
   [{:keys [::db/conn]} {:keys [::rpc/profile-id file-id id]}]
   (let [snapshot (fsnap/get-minimal-snapshot conn file-id id)]
-    (when-not snapshot
-      (ex/raise :type :not-found
-                :code :snapshot-not-found
-                :hint "unable to find snapshot with the provided id"
-                :snapshot-id id
-                :file-id file-id))
     (files/check-edition-permissions! conn profile-id (:file-id snapshot))
 
     (when (not= (:created-by snapshot) "user")
@@ -269,12 +251,6 @@
    ::db/transaction  true}
   [{:keys [::db/conn]} {:keys [::rpc/profile-id file-id id]}]
   (let [snapshot (fsnap/get-minimal-snapshot conn file-id id)]
-    (when-not snapshot
-      (ex/raise :type :not-found
-                :code :snapshot-not-found
-                :hint "unable to find snapshot with the provided id"
-                :snapshot-id id
-                :file-id file-id))
     (files/check-edition-permissions! conn profile-id (:file-id snapshot))
 
     (when (not= (:created-by snapshot) "user")

@@ -112,10 +112,15 @@
         sql (if (some? file-id)
               [sql:get-snapshot-without-data-with-file-id file-id snapshot-id now]
               [sql:get-snapshot-without-data snapshot-id now])]
-    (-> (db/get-with-sql cfg sql
-                         {::db/remove-deleted false
-                          ::db/throw-if-not-exists false})
-        (decode-snapshot))))
+    (or (-> (db/get-with-sql cfg sql
+                             {::db/remove-deleted false
+                              ::db/throw-if-not-exists false})
+            (decode-snapshot))
+        (ex/raise :type :not-found
+                  :code :snapshot-not-found
+                  :hint "unable to find snapshot with the provided id"
+                  :snapshot-id snapshot-id
+                  :file-id file-id))))
 
 (def ^:private sql:get-snapshot
   (str sql:snapshots
