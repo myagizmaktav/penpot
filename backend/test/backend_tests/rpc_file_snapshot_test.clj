@@ -79,6 +79,19 @@
           (t/is (= 0 (:revn row)))
           (t/is (= (:id profile) (:profile-id row))))))
 
+    (t/testing "update snapshot with file-id"
+      (let [params {::th/type :update-file-snapshot
+                    ::rpc/profile-id (:id profile)
+                    :file-id (:id file)
+                    :id @snapshot-id
+                    :label "label1-updated"}
+            out    (th/command! params)]
+        ;; (th/print-result! out)
+        (t/is (nil? (:error out)))
+        (t/is (true? (:result out)))
+        (t/is (= "label1-updated"
+                 (:label (th/db-get :file-change {:id @snapshot-id}))))))
+
     (t/testing "restore snapshot"
       (let [params {::th/type :restore-file-snapshot
                     ::rpc/profile-id (:id profile)
@@ -252,7 +265,9 @@
             out    (th/command! params)]
         ;; (th/print-result! out)
         (t/is (nil? (:error out)))
-        (t/is (true? (:result out)))))
+        (t/is (true? (:result out)))
+        (t/is (= "label2"
+                 (:label (th/db-get :file-change {:id (:id snapshot)}))))))
 
     (t/testing "lock snapshot without file-id"
       (let [params {::th/type :lock-file-snapshot
@@ -261,7 +276,9 @@
             out    (th/command! params)]
         ;; (th/print-result! out)
         (t/is (nil? (:error out)))
-        (t/is (true? (:result out)))))
+        (t/is (true? (:result out)))
+        (t/is (= (:id profile)
+                 (:locked-by (th/db-get :file-change {:id (:id snapshot)}))))))
 
     (t/testing "unlock snapshot without file-id"
       (let [params {::th/type :unlock-file-snapshot
@@ -270,7 +287,8 @@
             out    (th/command! params)]
         ;; (th/print-result! out)
         (t/is (nil? (:error out)))
-        (t/is (true? (:result out)))))
+        (t/is (true? (:result out)))
+        (t/is (nil? (:locked-by (th/db-get :file-change {:id (:id snapshot)}))))))
 
     (t/testing "delete snapshot without file-id"
       (let [params {::th/type :delete-file-snapshot
@@ -279,7 +297,45 @@
             out    (th/command! params)]
         ;; (th/print-result! out)
         (t/is (nil? (:error out)))
-        (t/is (true? (:result out))))
+        (t/is (true? (:result out)))
+        (t/is (some? (:deleted-at (th/db-get :file-change {:id (:id snapshot)}
+                                             {::db/remove-deleted false})))))
 
       ;; process the delete-object task enqueued by the snapshot delete
       (th/run-pending-tasks!))))
+
+(t/deftest snapshots-reject-a-file-id-that-does-not-match
+  ;; The snapshot commands filter by `file_id` so that, once `file_change` is
+  ;; hash-partitioned by it, the lookup prunes to a single partition. Sending
+  ;; a `file-id` of another file must not find nor touch the snapshot.
+  (let [profile  (th/create-profile* 1 {:is-active true})
+        file-a   (th/create-file* 1 {:profile-id (:id profile)
+                                     :project-id (:default-project-id profile)
+                                     :is-shared false})
+        file-b   (th/create-file* 2 {:profile-id (:id profile)
+                                     :project-id (:default-project-id profile)
+                                     :is-shared false})
+
+        snapshot (-> (th/command! {::th/type :create-file-snapshot
+                                   ::rpc/profile-id (:id profile)
+                                   :file-id (:id file-a)
+                                   :label "label1"})
+                     :result)]
+
+    (doseq [type [:update-file-snapshot :lock-file-snapshot
+                  :unlock-file-snapshot :delete-file-snapshot]]
+      (let [params (merge {::th/type type
+                           ::rpc/profile-id (:id profile)
+                           :file-id (:id file-b)
+                           :id (:id snapshot)}
+                          (when (= type :update-file-snapshot)
+                            {:label "label2"}))
+            out    (th/command! params)]
+
+        (t/is (th/ex-info? (:error out)))
+        (t/is (= :not-found (:type (ex-data (:error out)))))
+        (t/is (= :snapshot-not-found (:code (ex-data (:error out)))))
+        (t/is (= "label1"
+                 (:label (th/db-get :file-change {:id (:id snapshot)}
+                                    {::db/remove-deleted false})))
+              "the snapshot of file-a stays intact")))))

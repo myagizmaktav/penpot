@@ -66,73 +66,56 @@
      LEFT JOIN file_data AS fd ON (fd.file_id = f.id AND fd.id = f.id)
     WHERE f.id = ?")
 
+(def ^:private sql:snapshot-columns
+  "c.id,
+   c.label,
+   c.revn,
+   c.created_at,
+   c.modified_at,
+   c.deleted_at,
+   c.profile_id,
+   c.created_by,
+   c.locked_by,
+   c.features,
+   c.metadata,
+   c.migrations,
+   c.version,
+   c.file_id")
+
+(def ^:private sql:snapshot-visible
+  "AND CASE WHEN c.created_by = 'user'
+            THEN c.deleted_at IS NULL
+            WHEN c.created_by = 'system'
+            THEN c.deleted_at IS NULL OR c.deleted_at >= ?::timestamptz
+        END")
+
 (def ^:private sql:get-snapshot-without-data
   (str "WITH snapshots AS (" sql:snapshots ")"
-       "SELECT c.id,
-               c.label,
-               c.revn,
-               c.created_at,
-               c.modified_at,
-               c.deleted_at,
-               c.profile_id,
-               c.created_by,
-               c.locked_by,
-               c.features,
-               c.metadata,
-               c.migrations,
-               c.version,
-               c.file_id
-         FROM snapshots AS c
-        WHERE c.id = ?
-          AND CASE WHEN c.created_by = 'user'
-                   THEN c.deleted_at IS NULL
-                   WHEN c.created_by = 'system'
-                   THEN c.deleted_at IS NULL OR c.deleted_at >= ?::timestamptz
-               END"))
+       "SELECT " sql:snapshot-columns
+       " FROM snapshots AS c
+         WHERE c.id = ? " sql:snapshot-visible))
 
 (def ^:private sql:get-snapshot-without-data-with-file-id
   (str "WITH snapshots AS (" sql:snapshots ")"
-       "SELECT c.id,
-                c.label,
-                c.revn,
-                c.created_at,
-                c.modified_at,
-                c.deleted_at,
-                c.profile_id,
-                c.created_by,
-                c.locked_by,
-                c.features,
-                c.metadata,
-                c.migrations,
-                c.version,
-                c.file_id
-          FROM snapshots AS c
+       "SELECT " sql:snapshot-columns
+       " FROM snapshots AS c
          WHERE c.file_id = ?
-           AND c.id = ?
-           AND CASE WHEN c.created_by = 'user'
-                    THEN c.deleted_at IS NULL
-                    WHEN c.created_by = 'system'
-                    THEN c.deleted_at IS NULL OR c.deleted_at >= ?::timestamptz
-                END"))
+           AND c.id = ? " sql:snapshot-visible))
 
 (defn get-minimal-snapshot
   "Get the minimal snapshot info (without the data blob). When `file-id` is
   provided the query filters also by `file_id`, which allows partition
-  pruning once `file_change` is partitioned by it."
-  ([cfg snapshot-id]
-   (get-minimal-snapshot cfg nil snapshot-id))
-  ([cfg file-id snapshot-id]
-   (let [now          (ct/now)
-         with-file-id (uuid? file-id)
-         sql          (if with-file-id
-                        sql:get-snapshot-without-data-with-file-id
-                        sql:get-snapshot-without-data)
-         params       (if with-file-id
-                        [file-id snapshot-id now]
-                        [snapshot-id now])]
-     (-> (db/get-with-sql cfg (into [sql] params)
-                          {::db/remove-deleted false})
-         (decode-snapshot)))))
+  pruning once `file_change` is partitioned by it. Raises `:snapshot-not-found`
+  when there is no matching snapshot."
+  [cfg file-id snapshot-id]
+  (let [now (ct/now)
+        sql (if (some? file-id)
+              [sql:get-snapshot-without-data-with-file-id file-id snapshot-id now]
+              [sql:get-snapshot-without-data snapshot-id now])]
+    (-> (db/get-with-sql cfg sql
+                         {::db/remove-deleted false
+                          ::db/throw-if-not-exists false})
+        (decode-snapshot))))
 
 (def ^:private sql:get-snapshot
   (str sql:snapshots
