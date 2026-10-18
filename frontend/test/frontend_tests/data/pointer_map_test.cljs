@@ -77,6 +77,39 @@
                          :on-next #(reset! seen %)))))
     (t/is (= [:k fragment-content] @seen))))
 
+(t/deftest ^:async resolve-viewer-fragment-forwards-share-id
+  (let [share-id (uuid/custom 40 40)
+        seen     (atom ::none)]
+    (await
+     (mock/with-mocks*
+       {rp/cmd! (cmd-stub (fn [command params]
+                            (t/is (= :get-file-fragment command))
+                            (t/is (= {:file-id file-id :fragment-id frag-id :share-id share-id} params))
+                            (rx/of {:data fragment-content})))}
+       (await (a/observe (dv/resolve-viewer-fragment file-id share-id [:k (tr/->Pointer frag-id {})])
+                         :on-next #(reset! seen %)))))
+    (t/is (= [:k fragment-content] @seen))))
+
+(t/deftest ^:async resolve-file-rejects-unresolved-leftover-pointer
+  ;; A resolved fragment whose content is itself a pointer means the
+  ;; data still holds an unresolvable reference after the merge: the
+  ;; stream must reject with the local ex-info (not the transport
+  ;; cause), and deliver nothing.
+  (let [seen   (atom ::none)
+        caught (atom nil)]
+    (await
+     (mock/with-mocks*
+       {rp/cmd! (cmd-stub (fn [_command _params]
+                            (rx/of {:data (tr/->Pointer frag-id {})})))}
+       (await (a/observe (fpmap/resolve-file (file-with-pointers))
+                         :on-next #(reset! seen %)
+                         :on-error #(reset! caught %)))))
+    (t/is (= ::none @seen))
+    (t/is (some? @caught))
+    (let [data (ex-data @caught)]
+      (t/is (= file-id (:file-id data)))
+      (t/is (seq (:keys data))))))
+
 (t/deftest ^:async resolve-file-rejects-on-fragment-failure
   (let [failure (ex-info "fragment exploded" {})
         seen    (atom ::none)

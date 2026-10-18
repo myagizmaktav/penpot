@@ -72,8 +72,7 @@
       ;; response straight into state and cannot resolve pointers.
       ;; NOTE: the loader binds the live file-id, not the snapshot id.
       (let [base-file (bfc/get-file cfg file-id :load-data? false)
-            data      (fdata/with-pointers cfg file-id
-                        (fdata/process-pointers (:data snapshot) deref))]
+            data      (fdata/resolve-pointers cfg file-id (:data snapshot))]
         (-> base-file
             (assoc :data data)
             (assoc :version (:version snapshot))
@@ -91,7 +90,8 @@
   {::doc/added "1.20"
    ::sm/params schema:create-file-snapshot
    ::climit/id [[:create-file-snapshot/by-profile ::rpc/profile-id]
-                [:create-file-snapshot/global]]}
+                [:create-file-snapshot/global]]
+   ::db/transaction true}
   [cfg {:keys [::rpc/profile-id file-id label]}]
   (files/check-edition-permissions! cfg profile-id file-id)
   ;; NOTE: the file is intentionally NOT realized here: the snapshot
@@ -100,7 +100,12 @@
   ;; every unpurged snapshot as a liveness root, and readers
   ;; (get-file-snapshot, restore!, reduce-snapshots) resolve pointers
   ;; on demand.
-  (let [file    (bfc/get-file cfg file-id)
+  ;; NOTE: the file is read with FOR SHARE inside this transaction so
+  ;; snapshot creation serializes with a concurrent :file-gc pass
+  ;; (which takes FOR UPDATE + SKIP LOCKED on the same row). Without
+  ;; the lock, a version pinned mid-pass could reference fragment rows
+  ;; the pass is recreating.
+  (let [file    (bfc/get-file cfg file-id :lock-for-share? true)
         project (db/get-by-id cfg :project (:project-id file))]
 
     (-> cfg

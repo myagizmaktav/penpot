@@ -309,21 +309,28 @@
         (d/update-vals update-fn')
         (update :pages-index d/update-vals update-fn'))))
 
+(defn resolve-pointers
+  "Realize all pointers found in file data, binding the fragment loader
+  for the given file id. Unlike `realize-pointers`, the data map itself
+  does not need an `:id`: always pass the live file id explicitly (a
+  snapshot map carries the snapshot id, which would load the wrong
+  fragments)."
+  [cfg file-id data]
+  (binding [pmap/*load-fn* (partial load-pointer cfg file-id)]
+    (process-pointers data deref)))
+
 (defn realize-pointers
   "Process a file and remove all instances of pointers realizing them to
   a plain data. Used in operation where is more efficient have the
   whole file loaded in memory."
   [cfg {:keys [id] :as file}]
-  (binding [pmap/*load-fn* (partial load-pointer cfg id)]
-    (update file :data process-pointers deref)))
+  (update file :data (partial resolve-pointers cfg id)))
 
 (defn get-used-pointer-ids
   "Given a file data map, return all pointer ids used in the data.
-
-  Liveness contract (shared with file-gc): a fragment is alive when it
-  is referenced by the current main file data OR by any snapshot that
-  has not been purged yet. Snapshots share fragment rows with the live
-  file, so the collector must union both sets before marking."
+  This is a plain readout with no liveness meaning of its own: file-gc
+  unions it over the main file and every unpurged snapshot (see
+  `app.tasks.file-gc/clean-fragments!` for the actual liveness rule)."
   [fdata]
   (->> (concat (vals fdata)
                (vals (:pages-index fdata)))
@@ -355,15 +362,18 @@
   "Wraps a fragment load function with a per-call memory cache keyed by
   fragment id. Fragment rows are immutable, so a cached value can never
   go stale inside the transaction that reads it. The cache is created
-  per call and never escapes it. Successful loads are cached; misses
-  propagate and are not cached."
+  per call and never escapes it. Successful loads are cached (including
+  a legitimately nil payload); misses propagate and are not cached."
   [load-fn]
-  (let [cache (atom {})]
+  (let [cache (atom {})
+        miss  (Object.)]
     (fn [id]
-      (or (get @cache id)
+      (let [cached (get @cache id miss)]
+        (if (identical? cached miss)
           (let [data (load-fn id)]
             (swap! cache assoc id data)
-            data)))))
+            data)
+          cached)))))
 
 (defmacro with-pointers
   "Bind the fragment loader for `file-id` around `body`. All pointer

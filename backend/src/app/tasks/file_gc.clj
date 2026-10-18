@@ -20,6 +20,7 @@
    [app.common.time :as ct]
    [app.common.types.components-list :as ctkl]
    [app.common.types.file :as ctf]
+   [app.common.types.objects-map :as omap]
    [app.common.types.shape-tree :as ctt]
    [app.config :as cf]
    [app.db :as db]
@@ -27,6 +28,7 @@
    [app.features.file-snapshots :as fsnap]
    [app.jobs :as jobs]
    [app.storage :as sto]
+   [app.util.pointer-map :as pmap]
    [integrant.core :as ig]))
 
 (declare get-file)
@@ -198,12 +200,62 @@
   (comp (map :data)
         (mapcat feat.fdata/get-used-pointer-ids)))
 
+(defn- realize-entry
+  "Realize a file data entry (a page or the components map) to plain
+  data for value comparison: deref pointers and convert objects-maps
+  with the same `into {}` production uses. Requires *load-fn* bound."
+  [entry]
+  (let [entry (if (pmap/pointer-map? entry) (deref entry) entry)]
+    (if (and (map? entry) (contains? entry :objects))
+      (let [objects (:objects entry)]
+        (assoc entry :objects (if (omap/objects-map? objects)
+                                (into {} objects)
+                                objects)))
+      entry)))
+
+(defn- original-pointers
+  "Snapshot the current pointer layout of file data, mapping each
+  pointer position to its PointerMap. No loading involved."
+  [fdata]
+  {:root  (into {} (filter (fn [[_ v]] (pmap/pointer-map? v))) fdata)
+   :pages (into {} (filter (fn [[_ v]] (pmap/pointer-map? v)))
+                (:pages-index fdata {}))})
+
+(defn- reattach-unchanged
+  "Put back the original fragment pointers wherever the cleaned value
+  is value-equal to the stored fragment, so unchanged pages keep their
+  ids and no new fragment rows are persisted for them. Only positions
+  holding a PointerMap on both sides are eligible; anything added,
+  removed or actually changed keeps the cleaned value (and its new id).
+  Requires *load-fn* bound."
+  [original {:keys [data] :as file}]
+  (let [reattach (fn [current orig]
+                   (if (and (pmap/pointer-map? orig)
+                            (pmap/pointer-map? current)
+                            (= (realize-entry current)
+                               (realize-entry orig)))
+                     orig
+                     current))]
+    (-> file
+        (assoc :data
+               (let [data (reduce-kv (fn [m k v]
+                                       (assoc m k (reattach v (get-in original [:root k]))))
+                                     data
+                                     data)]
+                 (update data :pages-index
+                         (fn [pages]
+                           (reduce-kv (fn [m pid v]
+                                        (assoc m pid (reattach v (get-in original [:pages pid]))))
+                                      (or pages {})
+                                      (or pages {})))))))))
+
 (defn- clean-fragments!
-  "Mark fragment rows that are referenced neither by the live main file
-  data nor by any snapshot (snapshots share fragment rows with the live
-  file, see `app.features.fdata/get-used-pointer-ids`). `snap-pointers`
-  comes from a single `collect-snapshot-liveness` pass. Runs inside the
-  caller transaction, which already holds FOR UPDATE on the file row."
+  "Mark fragment rows referenced neither by the current main file data
+  nor by any unpurged snapshot. The file arrives unrealized (see
+  `get-file`), so `main-used` holds its stored fragment ids; combined
+  with `reattach-unchanged`, unchanged pages keep their ids and are
+  never marked. Runs inside the caller transaction, which already
+  holds FOR UPDATE on the file row."
   [{:keys [::db/conn ::timestamp] :as cfg} snap-pointers {:keys [id] :as file}]
   (let [main-used (into #{} xf:collect-pointers [file])
         used      (into main-used snap-pointers)
@@ -231,8 +283,12 @@
 
 (defn get-file
   [cfg {:keys [file-id revn]}]
+  ;; NOTE: deliberately NOT realized: `process-file!` binds the fragment
+  ;; loader and works on PointerMaps directly, so unchanged pages keep
+  ;; their fragment ids (see `reattach-unchanged`). Realizing here would
+  ;; force every page to be re-persisted under a new id on every pass.
   (let [file (bfc/get-file cfg file-id
-                           :realize? true
+                           :realize? false
                            :skip-locked? true
                            :lock-for-update? true)]
 
@@ -248,14 +304,17 @@
 (defn- process-file!
   [cfg {:keys [file-id] :as props}]
   (if-let [file (get-file cfg props)]
-    (let [liveness (collect-snapshot-liveness cfg file-id)
-          file (->> file
-                    (bfl/clean-file)
-                    (clean-media! cfg liveness)
-                    (clean-fragments! cfg (:pointers liveness)))
-          file (assoc file :has-media-trimmed true)]
-      (bfc/update-file! cfg file)
-      true)
+    (feat.fdata/with-pointers cfg file-id
+      (let [liveness (collect-snapshot-liveness cfg file-id)
+            original (original-pointers (:data file))
+            file (->> file
+                      (bfl/clean-file)
+                      (clean-media! cfg liveness)
+                      (reattach-unchanged original)
+                      (clean-fragments! cfg (:pointers liveness)))
+            file (assoc file :has-media-trimmed true)]
+        (bfc/update-file! cfg file)
+        true))
 
     (do
       (l/dbg :hint "skip cleaning, criteria does not match" :file-id (str file-id))

@@ -175,6 +175,23 @@
           (t/is (some? row))
           (t/is (some? (:deleted-at row))))))))
 
+(t/deftest file-gc-is-idempotent-on-unchanged-file
+  ;; A file-gc pass over an unchanged file must not create fragment
+  ;; rows nor mark any: unchanged pages keep their ids.
+  (let [profile (th/create-profile* 1)
+        file    (th/create-file* 1 {:profile-id (:id profile)
+                                    :project-id (:default-project-id profile)
+                                    :is-shared false})
+        file-id (:id file)
+        before  (live-fragment-ids file-id)]
+    (t/is (pos? (count before)))
+    (t/is (true? (th/run-task! :file-gc {:file-id file-id})))
+    (let [after-first (live-fragment-ids file-id)]
+      (t/is (= before after-first))
+      (t/is (true? (th/run-task! :file-gc {:file-id file-id})))
+      (t/is (= after-first (live-fragment-ids file-id)))
+      (t/is (every? #(nil? (:deleted-at %)) (fragment-rows file-id))))))
+
 (t/deftest gc-marks-fragments-without-live-reference
   (let [profile (th/create-profile* 1)
         file    (th/create-file* 1 {:profile-id (:id profile)
@@ -220,13 +237,15 @@
 
 (t/deftest memoize-loader-caches-per-id
   ;; The per-pass cache contract: repeated loads of the same fragment
-  ;; hit the underlying loader exactly once.
+  ;; hit the underlying loader exactly once — including a legitimately
+  ;; nil payload, which must not be reloaded.
   (let [calls (atom 0)
         load  (fdata/memoize-loader
-               (fn [id] (swap! calls inc) {:id id}))]
+               (fn [id] (swap! calls inc) (when (odd? id) {:id id})))]
     (t/is (= {:id 1} (load 1)))
     (t/is (= {:id 1} (load 1)))
-    (t/is (= {:id 2} (load 2)))
+    (t/is (nil? (load 2)))
+    (t/is (nil? (load 2)))
     (t/is (= 2 @calls))))
 
 (t/deftest restore-returns-snapshot-content

@@ -12,7 +12,6 @@
    [app.common.files.changes :as cpc]
    [app.common.files.helpers :as cfh]
    [app.common.geom.point :as gpt]
-   [app.common.logging :as log]
    [app.common.schema :as sm]
    [app.common.transit :as t]
    [app.common.types.shape-tree :as ctt]
@@ -25,6 +24,7 @@
    [app.main.data.fonts :as df]
    [app.main.data.helpers :as dsh]
    [app.main.features :as features]
+   [app.main.features.pointer-map :as fpmap]
    [app.main.repo :as rp]
    [app.main.router :as rt]
    [app.render-wasm.api :as wasm.api]
@@ -123,23 +123,10 @@
 
 (defn resolve-viewer-fragment
   "Resolves one pointer-mapped entry of the view-only bundle into a
-  [key data] pair. A failing fragment rejects with the original cause
-  (logged with file-id and fragment-id) instead of resolving to a
-  silently pruned entry."
-  [file-id share-id [key pointer]]
-  (let [params {:file-id file-id :fragment-id @pointer}
-        params (cond-> params
-                 (uuid? share-id)
-                 (assoc :share-id share-id))]
-    (->> (rp/cmd! :get-file-fragment params)
-         (rx/map :data)
-         (rx/map #(vector key %))
-         (rx/catch (fn [cause]
-                     (log/error :hint "unable to resolve viewer fragment"
-                                :file-id (str file-id)
-                                :fragment-id (str @pointer)
-                                :cause cause)
-                     (rx/throw cause))))))
+  [key data] pair. Thin wrapper over the shared `fpmap/resolve-pointer`
+  with share-link scoping; see it for the failure contract."
+  [file-id share-id entry]
+  (fpmap/resolve-pointer file-id share-id entry))
 
 (defn- fetch-bundle
   [{:keys [file-id share-id] :as params}]

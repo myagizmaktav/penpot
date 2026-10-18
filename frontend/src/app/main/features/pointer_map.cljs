@@ -16,24 +16,35 @@
   [m]
   (into [] (comp (filter (fn [[_ v]] (t/pointer? v))) (map key)) m))
 
+(defn resolve-pointer
+  "Resolves a single [key pointer] entry into a [key data] pair against
+  `get-file-fragment`. A failing fragment rejects with the original
+  cause (logged with file-id and fragment-id) instead of resolving to
+  a silently pruned entry. Pass a share-id for share-link scoped
+  resolution, as the viewer does."
+  ([file-id entry]
+   (resolve-pointer file-id nil entry))
+  ([file-id share-id [key pointer :as kv]]
+   (if (t/pointer? pointer)
+     (let [params (cond-> {:file-id file-id :fragment-id @pointer}
+                    (uuid? share-id)
+                    (assoc :share-id share-id))]
+       (->> (rp/cmd! :get-file-fragment params)
+            (rx/map :data)
+            (rx/map #(vector key %))
+            (rx/catch (fn [cause]
+                        (log/error :hint "unable to resolve file fragment"
+                                   :file-id (str file-id)
+                                   :fragment-id (str @pointer)
+                                   :cause cause)
+                        (rx/throw cause)))))
+     (rx/of kv))))
+
 (defn resolve-file
   [{:keys [id data] :as file}]
-  (letfn [(resolve-pointer [[key val :as kv]]
-            (if (t/pointer? val)
-              (->> (rp/cmd! :get-file-fragment {:file-id id :fragment-id @val})
-                   (rx/map #(get % :data))
-                   (rx/map #(vector key %))
-                   (rx/catch (fn [cause]
-                               (log/error :hint "unable to resolve file fragment"
-                                          :file-id (str id)
-                                          :fragment-id (str @val)
-                                          :cause cause)
-                               (rx/throw cause))))
-              (rx/of kv)))
-
-          (resolve-pointers [coll]
+  (letfn [(resolve-pointers [coll]
             (->> (rx/from (seq coll))
-                 (rx/merge-map resolve-pointer)
+                 (rx/merge-map (partial resolve-pointer id))
                  (rx/reduce conj {})))]
 
     (->> (rx/zip (resolve-pointers data)
