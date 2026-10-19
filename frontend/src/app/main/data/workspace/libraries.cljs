@@ -908,8 +908,7 @@
      ptk/WatchEvent
      (watch [it state _]
        (log/info :msg "UPDATE-COMPONENT of shape" :id (str id) :undo-group undo-group)
-       (let [;; The commits in both files are one action: a save that
-             ;; rejects one of them reverts the other too.
+       (let [;; One undo group for the commits in both files
              undo-group    (or undo-group (uuid/next))
              page-id       (:current-page-id state)
 
@@ -994,8 +993,7 @@
              shape           (ctn/get-shape page shape-id)
              component-id    (:component-id shape)
              undo-id         (js/Symbol)
-             ;; Every commit of the update and of the syncs, in any file,
-             ;; is one action: a save that rejects one reverts them all.
+             ;; One undo group for the update and the syncs, in any file
              undo-group      (or undo-group (uuid/next))]
          (rx/of
           (dwu/start-undo-transaction undo-id)
@@ -1020,7 +1018,7 @@
      (watch [_ state _]
        (let [current-file-id (:current-file-id state)
              undo-id         (js/Symbol)
-             ;; The syncs of both files are one action.
+             ;; One undo group for the syncs of both files
              undo-group      (or undo-group (uuid/next))]
          (rx/of
           (dwu/start-undo-transaction undo-id)

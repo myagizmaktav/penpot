@@ -70,8 +70,7 @@
              (rx/ignore))))))
 
 (defn- get-pending-commits
-  "Local commits the server has not saved yet, oldest first: the queued
-  ones, then the ones still buffered."
+  "Unsaved local commits, oldest first: queued, then buffered."
   [{:keys [persistence]}]
   (-> []
       (into (map (d/getf (:index persistence))) (:queue persistence))
@@ -215,11 +214,9 @@
              (rx/of (update-indexes commit :redo-changes)))))))))
 
 (defn rebase-commits
-  "Rewrites the local data of the file `file-id`: undoes the commits in
-  `undo`, applies the `remote` changes, then redoes the commits in `redo`
-  (commits given oldest first). It is not a commit: nothing is saved,
-  broadcast or added to the undo history. When the changes cannot be
-  applied, the file is loaded again from the server."
+  "Undoes `undo`, applies `remote` and redoes `redo` on the local data of
+  `file-id`, commits oldest first. Nothing is saved or added to the undo
+  history; if the changes fail to apply, the file is reloaded."
   [file-id {:keys [undo remote redo]}]
   (let [commit  {:file-id file-id
                  :redo-changes (-> []

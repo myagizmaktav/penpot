@@ -1314,8 +1314,7 @@
       ptk/WatchEvent
       (watch [it state _]
         (cond
-          ;; The shape is gone, e.g. a rejected save was rolled back while it
-          ;; was edited: nothing to commit, only the editing session to forget.
+          ;; The shape is gone (e.g. a rollback): only forget the edit session
           (not (contains? (dsh/lookup-page-objects state) id))
           (rx/of (fn [state]
                    (-> state

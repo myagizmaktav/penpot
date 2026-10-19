@@ -619,8 +619,8 @@
   (st/emit! (set-shape-ref* id shape-ref)))
 
 (def ^:private invalid-change-kinds
-  "Ways to break a page objects map so the backend validation rejects the
-  commit, with the validation error each one raises."
+  "Ways to break page objects that backend validation rejects, with the
+  error code each raises."
   {"parent" {:code  :parent-not-found
              :break (fn [objects shape]
                       (assoc-in objects [(:id shape) :parent-id] (uuid/next)))}
@@ -642,8 +642,8 @@
         (changed-ids objects objects')))
 
 (defn- rename-components
-  "`data` with the component of each renamed main instance in `objects'`
-  named like it."
+  "Renames in `data` the components of the main instances renamed in
+  `objects'`."
   [data objects objects']
   (reduce (fn [data {:keys [component-id name]}]
             (let [[path name] (cpn/split-group-name name)]
@@ -652,10 +652,8 @@
           (renamed-main-instances objects objects')))
 
 (defn- commit-objects-change
-  "Commits the shapes that differ between `objects` and `objects'`, with
-  the undo changes that restore them. A renamed main instance renames its
-  component in the same commit (`data` holds the components before it), as
-  the validation requires both names to match."
+  "Commits the shapes that differ between `objects` and `objects'`. A
+  renamed main instance renames its component too, as validation requires."
   [origin page-id data objects objects']
   (dwc/commit-changes
    (reduce (fn [changes {:keys [component-id name]}]
@@ -666,10 +664,9 @@
            (renamed-main-instances objects objects'))))
 
 (defn ^:export commitInvalidChange
-  "Commits a change that the backend validation rejects, on the selected
-  shape or, with nothing selected, the first shape of the page. Renames of
-  the same shape can be committed before and after it, so one save carries
-  valid commits around the invalid one. The batch is saved at once.
+  "Commits a change that backend validation rejects, on the selected shape
+  or the first one of the page, with optional valid renames before and
+  after it, all in one save.
 
   Kinds: 'parent' (the shape points to a missing parent, the default) and
   'child' (its parent lists a missing child).
@@ -717,10 +714,7 @@
                                  (last))]
                 (rx/concat
                  (rx/from commits)
-                 ;; Lets every commit reach the persistence buffer first, so
-                 ;; the whole batch goes in one save, and waits past the
-                 ;; pending-status debounce (200ms), which would otherwise
-                 ;; land after the save and leave the status pending.
+                 ;; Saves once all commits are buffered and the 200ms pending debounce passed
                  (->> (rx/timer 300)
                       (rx/map (constantly ::dps/force-persist))))))))
          (str "committed " (+ before 1 after) " changes on '" (:name shape)

@@ -252,10 +252,8 @@
           (add-transaction-undo-entry)))))
 
 (defn forget-undo-groups
-  "Drops the undo history from the first entry of any of `undo-groups` on,
-  because those changes are no longer applied, and empties the open
-  transaction. Without such an entry the whole history goes: the changes
-  may sit inside an entry of another group, stacked onto it."
+  "Drops the undo history from the first entry of `undo-groups` on, or all
+  of it if none matches, and empties the open transaction."
   [undo-groups]
   (ptk/reify ::forget-undo-groups
     ptk/UpdateEvent

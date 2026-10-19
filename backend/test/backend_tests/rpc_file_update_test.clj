@@ -229,8 +229,10 @@
                               (fn [& args]
                                 ;; The first call is the single pass over
                                 ;; every commit; the database fails on the
-                                ;; second commit of the one-by-one pass.
-                                (when (= 3 (swap! calls inc))
+                                ;; first attempt of the retry. The 3-arity
+                                ;; call is the same pass.
+                                (when (and (= 2 (count args))
+                                           (= 2 (swap! calls inc)))
                                   (throw (java.sql.SQLException. "connection lost")))
                                 (apply process args))]
                   (update-file ctx {:changes-with-metadata
@@ -241,3 +243,87 @@
                                               :page {:id (uuid/next) :name "page" :objects {}}})]}))]
     (t/is (instance? java.sql.SQLException (:error out)))
     (t/is (= 0 (:revn (th/db-get :file {:id (:file-id ctx)}))))))
+
+(defn- move-rect
+  [page-id id x]
+  {:type :mod-obj
+   :page-id page-id
+   :id id
+   :operations [{:type :set :attr :x :val x}]})
+
+(defn- update-file-counting
+  "Updates the file and counts the times the changes are applied."
+  [ctx params]
+  (let [process cpc/process-changes
+        calls   (atom 0)
+        out     (with-redefs [cpc/process-changes
+                              (fn [& args]
+                                ;; The 3-arity call is the same application
+                                (when (= 2 (count args))
+                                  (swap! calls inc))
+                                (apply process args))]
+                  (update-file ctx params))]
+    {:out out :calls @calls}))
+
+(t/deftest bisects-the-commits-to-find-the-invalid-one
+  (let [{:keys [page-id] :as ctx} (create-file)
+        shape-a (uuid/next)
+        _       (update-file ctx {:changes [(add-rect page-id shape-a)]})
+        commits (mapv (fn [i]
+                        (if (= i 5)
+                          (commit (break-parent page-id shape-a))
+                          (commit (move-rect page-id shape-a i))))
+                      (range 16))
+
+        {:keys [out calls]}
+        (update-file-counting ctx {:revn 1 :changes-with-metadata commits})]
+
+    (t/is (nil? (:error out)))
+    (t/is (= (mapv :commit-id (subvec commits 5))
+             (-> out :result :rejected :commit-ids)))
+    (t/is (= (:commit-id (nth commits 5))
+             (-> out :result :rejected :failed-commit-id)))
+    (t/is (= :referential-integrity (-> out :result :rejected :error :code)))
+
+    (t/testing "the single pass plus log2 of the commits attempts"
+      (t/is (= 5 calls)))
+
+    (t/testing "the file holds the commits before the invalid one"
+      (let [objects (-> (get-file-data ctx) :pages-index (get page-id) :objects)]
+        (t/is (= uuid/zero (get-in objects [shape-a :parent-id])))
+        (t/is (= 4 (get-in objects [shape-a :x])))))))
+
+(t/deftest rejects-a-single-commit-without-a-retry
+  (let [{:keys [page-id] :as ctx} (create-file)
+        shape-a (uuid/next)
+        _       (update-file ctx {:changes [(add-rect page-id shape-a)]})
+        commit1 (commit (break-parent page-id shape-a))
+
+        {:keys [out calls]}
+        (update-file-counting ctx {:revn 1 :changes-with-metadata [commit1]})]
+
+    (t/is (nil? (:error out)))
+    (t/is (= [(:commit-id commit1)] (-> out :result :rejected :commit-ids)))
+    (t/is (= :referential-integrity (-> out :result :rejected :error :code)))
+    (t/is (= 1 calls))
+    (t/is (= 1 (:revn (th/db-get :file {:id (:file-id ctx)}))))))
+
+(t/deftest keeps-a-commit-that-repairs-an-earlier-one
+  (let [{:keys [page-id] :as ctx} (create-file)
+        shape-a (uuid/next)
+        shape-c (uuid/next)
+        _       (update-file ctx {:changes [(add-rect page-id shape-a)]})
+        commit1 (commit (break-parent page-id shape-a))
+        commit2 (commit {:type :mod-obj
+                         :page-id page-id
+                         :id shape-a
+                         :operations [{:type :set :attr :parent-id :val uuid/zero}]})
+        commit3 (commit (add-rect page-id shape-c))
+        commit4 (commit (break-parent page-id shape-c))
+        out     (update-file ctx {:revn 1 :changes-with-metadata [commit1 commit2 commit3 commit4]})
+        objects (-> (get-file-data ctx) :pages-index (get page-id) :objects)]
+
+    (t/is (nil? (:error out)))
+    (t/is (= [(:commit-id commit4)] (-> out :result :rejected :commit-ids)))
+    (t/is (= uuid/zero (get-in objects [shape-a :parent-id])))
+    (t/is (= uuid/zero (get-in objects [shape-c :parent-id])))))

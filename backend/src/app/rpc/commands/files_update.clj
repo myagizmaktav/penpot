@@ -178,8 +178,7 @@
                    (->> changes-with-metadata (mapcat :changes) vec)
                    (vec changes))
 
-        ;; Commits that are accepted or rejected one by one; without
-        ;; commit ids the whole request is accepted or rejected.
+        ;; Saved commit by commit only when every group names its commit
         commits  (when (and (seq changes-with-metadata)
                             (every? :commit-id changes-with-metadata))
                    changes-with-metadata)
@@ -306,22 +305,20 @@
 
           ;; A request whose first commit is rejected leaves the file as is
           saved?   (or (nil? rejected) (seq changes))
+          snapshot (when saved? (::snapshot file))
 
           deleted-at
           (ct/plus timestamp (ct/duration {:hours 1}))]
 
+      (when snapshot
+        (fsnap/create! cfg snapshot
+                       {:label (str "internal/snapshot/" revn)
+                        :created-by "system"
+                        :deleted-at (ct/plus timestamp (ldel/get-deletion-delay team))
+                        :profile-id profile-id
+                        :session-id session-id}))
+
       (when saved?
-        (when-let [file (::snapshot file)]
-          (let [deleted-at (ct/plus timestamp (ldel/get-deletion-delay team))
-                label      (str "internal/snapshot/" revn)]
-
-            (fsnap/create! cfg file
-                           {:label label
-                            :created-by "system"
-                            :deleted-at deleted-at
-                            :profile-id profile-id
-                            :session-id session-id})))
-
         ;; Insert change (xlog) with deleted_at in a future data for
         ;; make them automatically eleggible for GC once they expires
         (db/insert! conn :file-change
@@ -480,46 +477,47 @@
        (finally
          (record-validation-timing ~cfg ~step-key ~step-label (inst-ms (t#)))))))
 
-(defn- validate-file-schema
-  [cfg file skip-validate]
+(defn- validate-file
+  "Validates the entities affected by `changes` and the file schema."
+  [cfg file libs changes skip-validate]
   (binding [pmap/*tracked* nil]
+    (when (contains? cf/flags :soft-file-validation)
+      (with-validation-timing cfg :soft-validate-affected-ms "soft-validate-affected"
+        (soft-validate-file! file libs changes)))
+
     (when (contains? cf/flags :soft-file-schema-validation)
       (with-validation-timing cfg :soft-validate-schema-ms "soft-validate-schema"
         (soft-validate-file-schema! file)))
+
+    (when (and (contains? cf/flags :file-validation)
+               (not skip-validate))
+      (with-validation-timing cfg :validate-affected-ms "validate-affected"
+        (val/validate-file-affected! file libs changes)))
 
     (when (and (contains? cf/flags :file-schema-validation)
                (not skip-validate))
       (with-validation-timing cfg :validate-schema-ms "validate-schema"
         (val/validate-file-schema! file)))))
 
-(defn- validate-file
-  "Validates the referential integrity of the entities affected by
-  `changes` and, with `schema?`, the schema of the whole file."
-  [cfg file libs changes skip-validate schema?]
-  (binding [pmap/*tracked* nil]
-    (when (contains? cf/flags :soft-file-validation)
-      (with-validation-timing cfg :soft-validate-affected-ms "soft-validate-affected"
-        (soft-validate-file! file libs changes)))
-
-    (when (and (contains? cf/flags :file-validation)
-               (not skip-validate))
-      (with-validation-timing cfg :validate-affected-ms "validate-affected"
-        (val/validate-file-affected! file libs changes))))
-
-  (when schema?
-    (validate-file-schema cfg file skip-validate)))
-
 (defn- apply-changes
-  "Applies `changes` to the file data and validates the file against
-  `validated-changes`, the changes whose affected entities are checked."
-  [cfg file libs changes validated-changes skip-validate schema?]
+  "Applies and validates `changes`."
+  [cfg file libs changes skip-validate]
   (let [file (with-validation-timing cfg :process-changes-ms "process-changes"
                (update file :data (fn [data]
                                     (-> data
                                         (cpc/process-changes changes)
                                         (d/without-nils)))))]
-    (validate-file cfg file libs validated-changes skip-validate schema?)
+    (validate-file cfg file libs changes skip-validate)
     file))
+
+(defn- decode-objects!
+  "Decodes the objects of the pages `changes` touch. Every file derived from
+  `file` shares them, so each attempt does not decode them again."
+  [file changes]
+  (doseq [page-id (into #{} (keep :page-id) changes)]
+    (let [objects (get-in file [:data :pages-index page-id :objects])]
+      (doseq [id (keys objects)]
+        (get objects id)))))
 
 (defn- infrastructure-error?
   [cause]
@@ -532,17 +530,15 @@
         (take-while some? (iterate ex-cause cause))))
 
 (defn- change-failure?
-  "True when `cause` comes from applying or validating changes, and not from
-  the database, the network, a missing fragment or the JVM. Only a change
-  failure rejects a commit; anything else fails the whole request."
+  "True when `cause` comes from applying or validating changes. Only these
+  reject a commit; any other error fails the whole request."
   [cause]
   (and (or (instance? Exception cause)
            (instance? AssertionError cause))
        (not (infrastructure-error? cause))))
 
 (defn- rejection
-  "Describes the rejection of `commits`, the first of which failed with
-  `cause`."
+  "Describes `commits` as rejected, the first one failing with `cause`."
   [commits cause]
   (let [data (ex-data cause)]
     {:commit-ids       (mapv :commit-id commits)
@@ -557,66 +553,59 @@
                           :code :unexpected-error
                           :hint (or (ex-message cause) (.getName (class cause)))})}))
 
-(defn- apply-commits
-  "Applies `commits` one at a time and keeps every commit before the first
-  one that fails. Each commit is validated together with the commits
-  accepted before it, which checks the same entities as validating them
-  all at once; with `schema?` the whole file schema is checked after each
-  commit too. The returned file carries the accepted changes under
-  `::changes` and, when a commit failed, its rejection under `::rejected`."
-  [cfg file libs commits skip-validate state schema?]
-  (loop [file     file
-         accepted []
-         commits  commits]
-    (if-let [{:keys [commit-id changes]} (first commits)]
-      (let [tracked   @pmap/*tracked*
-            refs      @state
-            accepted' (into accepted changes)
-            result    (try
-                        (apply-changes cfg file libs changes accepted' skip-validate schema?)
-                        (catch Throwable cause
-                          (when-not (change-failure? cause)
-                            (throw cause))
-                          cause))]
-        (if (instance? Throwable result)
-          (do
-            ;; Forget the fragments and media refs of the failed commit
-            (reset! pmap/*tracked* tracked)
-            (reset! state refs)
-            (l/error :hint "update-file commit rejected"
-                     :file-id (str (:id file))
-                     :commit-id (str commit-id)
-                     :rejected (count commits)
-                     :cause result)
-            (assoc file
-                   ::changes accepted
-                   ::rejected (rejection commits result)))
-          (recur result accepted' (rest commits))))
-      (assoc file ::changes accepted))))
+(defn- apply-prefix
+  "Applies and validates the first `n` commits from `file` and the pointers
+  in `tracked`. Returns the file, or the cause of the failure."
+  [cfg file libs commits n skip-validate state tracked]
+  (reset! pmap/*tracked* tracked)
+  (reset! state {})
+  (let [changes (into [] (comp (take n) (mapcat :changes)) commits)]
+    (try
+      (-> (apply-changes cfg file libs changes skip-validate)
+          (assoc ::changes changes))
+      (catch Throwable cause
+        (when-not (change-failure? cause)
+          (throw cause))
+        cause))))
 
-(defn- apply-commits-and-validate
-  "Applies `commits` one at a time checking only referential integrity, then
-  checks the schema of the result once. When that check fails, applies them
-  again from `file` checking the schema after each commit, to find the one
-  that breaks it. `tracked` is the pointer tracking to start again from."
-  [cfg file libs commits skip-validate state tracked]
-  (let [result (apply-commits cfg file libs commits skip-validate state false)]
-    (if (empty? (::changes result))
-      result
-      (try
-        (validate-file-schema cfg result skip-validate)
-        result
-        (catch Throwable cause
-          (when-not (change-failure? cause)
-            (throw cause))
-          (reset! pmap/*tracked* tracked)
-          (reset! state {})
-          (apply-commits cfg file libs commits skip-validate state true))))))
+(defn- apply-commits
+  "Keeps the longest prefix of `commits` that applies and validates, found
+  by bisection, and rejects the rest. `cause` is the failure of all of them
+  together. Takes about log2 of the commits attempts, each from `file` and
+  the pointers in `tracked`; a commit that repairs an earlier one can keep
+  both. Returns the file with the accepted changes in `::changes` and the
+  rejection in `::rejected`."
+  [cfg file libs commits skip-validate state tracked cause]
+  (let [tpoint (ct/tpoint)]
+    (loop [lo       0
+           hi       (count commits)
+           cause    cause
+           attempts 0
+           accepted nil]
+      (if (> (- hi lo) 1)
+        (let [mid    (quot (+ lo hi) 2)
+              result (apply-prefix cfg file libs commits mid skip-validate state tracked)]
+          (if (instance? Throwable result)
+            (recur lo mid result (inc attempts) accepted)
+            (recur mid hi cause (inc attempts) {:file result :tracked @pmap/*tracked* :refs @state})))
+        (let [rejected (subvec commits lo)]
+          ;; Back to the fragments to persist and media refs of the kept prefix
+          (reset! pmap/*tracked* (:tracked accepted tracked))
+          (reset! state (:refs accepted {}))
+          (l/error :hint "update-file commit rejected"
+                   :file-id (str (:id file))
+                   :commit-id (str (:commit-id (first rejected)))
+                   :rejected (count rejected)
+                   :commits (count commits)
+                   :attempts attempts
+                   :elapsed (ct/format-duration (tpoint))
+                   :cause cause)
+          (assoc (:file accepted (assoc file ::changes []))
+                 ::rejected (rejection rejected cause)))))))
 
 (defn- process-changes-and-validate
-  "Applies and validates all `changes` at once. When that fails and the
-  request carries `commits`, applies them again one at a time from the
-  original data to keep the commits before the failing one."
+  "Applies and validates all `changes` at once. If that fails and there are
+  `commits`, keeps the longest prefix of them that validates."
   [cfg file changes commits skip-validate]
   (let [should-resolve-libs?
         (and (or (contains? cf/flags :file-validation)
@@ -645,17 +634,21 @@
 
         file
         (binding [cpc/*state* state]
+          ;; Validation decodes the touched pages anyway; decoded on `file`,
+          ;; a retry shares them
+          (when (and (next commits)
+                     (not skip-validate)
+                     (or (contains? cf/flags :file-validation)
+                         (contains? cf/flags :file-schema-validation)))
+            (decode-objects! file changes))
           (try
-            (-> (apply-changes cfg file libs changes changes skip-validate true)
+            (-> (apply-changes cfg file libs changes skip-validate)
                 (assoc ::changes changes))
             (catch Throwable cause
               (when-not (and (some? commits)
                              (change-failure? cause))
                 (throw cause))
-              ;; Forget the fragments and media refs of the failed attempt
-              (reset! pmap/*tracked* tracked)
-              (reset! state {})
-              (apply-commits-and-validate cfg file libs commits skip-validate state tracked))))]
+              (apply-commits cfg file libs (vec commits) skip-validate state tracked cause))))]
 
     (if-let [media-refs (-> @state :media-refs not-empty)]
       (bfc/update-media-references! cfg file media-refs)

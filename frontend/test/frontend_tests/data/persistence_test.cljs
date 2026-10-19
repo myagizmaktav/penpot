@@ -1202,8 +1202,7 @@
 ;; Scenario: an edit waits in the buffer when another user's change to the
 ;; same attribute arrives. The server will apply the remote change first and
 ;; the buffered edit after it, so the local file must end the same way.
-;; Proves: a remote commit is applied under buffered edits too, not only
-;; under queued ones.
+;; Proves: a remote commit is applied under buffered edits too.
 (t/deftest ^:async a-remote-commit-goes-under-buffered-edits
   (await
    (with-persistence
@@ -1366,7 +1365,7 @@
 ;; edit and rejects the second. The server holds the peer's opacity, so the
 ;; local file must too, not the opacity from before the rejected edit.
 ;; Proves: the rollback applies the peer's changes again over the undone
-;; commits instead of overwriting them with stale values.
+;; commits.
 (t/deftest ^:async a-rollback-keeps-a-peer-change-to-the-same-attribute
   (await
    (with-persistence

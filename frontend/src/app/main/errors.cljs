@@ -490,8 +490,8 @@
 (defn flash
   "Show error notification banner and emit error report.
   A nil timeout keeps the notification visible until dismissed or replaced.
-  A `:tag` lets the notification be hidden later by that tag. The toast is
-  an error unless another `:level` is given.
+  A `:tag` lets the notification be hidden later by that tag. `:level`
+  defaults to `:error`.
 
   The payload format is derived from the cause: environment failures get a
   compact report. The audit event name is the canonical one requested by

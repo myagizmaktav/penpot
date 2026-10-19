@@ -280,19 +280,19 @@
       (swap! revn-data update file-id (fnil max 0) revn))))
 
 (defn- pending-commits
-  "Commits of `file-id` the server has not saved yet, oldest first: those of
-  its queue entries, then the buffered ones."
+  "Unsaved commits of `file-id`, oldest first: queued, then buffered."
   [pstate file-id]
-  (-> []
-      (into (comp (map #(get-in pstate [:index %]))
-                  (filter #(= file-id (:file-id %)))
-                  (mapcat :commits))
-            (:queue pstate))
-      (into (filter #(= file-id (:file-id %))) (:buffer pstate))))
+  (let [file?     #(= file-id (:file-id %))
+        xf:queued (comp (map #(get-in pstate [:index %]))
+                        (filter file?)
+                        (mapcat :commits))]
+    (-> []
+        (into xf:queued (:queue pstate))
+        (into (filter file?) (:buffer pstate)))))
 
 (defn- prune-remote-changes
-  "Forgets the remote changes of `file-id` that arrived before its oldest
-  pending commit: a rollback re-applies only the later ones."
+  "Forgets the remote changes of `file-id` older than its oldest pending
+  commit, which a rollback never applies again."
   [pstate file-id]
   (if-let [since (some-> (first (pending-commits pstate file-id)) :remote-seq)]
     (d/update-in-when pstate [:remote-changes file-id]
@@ -301,8 +301,7 @@
 
 (defn- record-remote-changes
   "Numbers a remote commit and, while `file-id` has pending commits, keeps
-  its changes: rolling back a rejected commit has to apply them again over
-  the undone commits, as the server did."
+  its changes for a rollback to apply again."
   [file-id changes]
   (ptk/reify ::record-remote-changes
     ptk/UpdateEvent
@@ -316,17 +315,15 @@
                                {:seq number :changes changes}))))))))
 
 (defn- pending-files
-  "Files that have commits the server has not saved yet."
+  "Files with unsaved commits."
   [pstate]
   (-> #{}
       (into (map #(get-in pstate [:index % :file-id])) (:queue pstate))
       (into (map :file-id) (:buffer pstate))))
 
 (defn- keep-saved-commits
-  "Remembers the commits of the saved queue entry `entry` whose undo group
-  a pending commit shares, and forgets the remembered ones no pending
-  commit shares any more. An undo group is one user action: if a later
-  commit of it is rejected, its saved commits have to be undone too."
+  "Keeps the saved commits, `entry`'s included, whose undo group a pending
+  commit shares: if that commit is rejected they are undone too."
   [pstate {:keys [file-id commits]}]
   (let [groups (into #{}
                      (keep :undo-group)
@@ -356,13 +353,13 @@
                                                :retry-for)))))))
 
 (defn- without-commits
-  "Removes from `buffer` the commits listed in `commits`."
+  "`buffer` without `commits`."
   [buffer commits]
   (let [ids (into #{} (map :id) commits)]
     (into [] (remove #(contains? ids (:id %))) buffer)))
 
 (defn- buffer-commit
-  "Keeps a local commit in the store until the next flush queues it."
+  "Keeps a local commit in the buffer until the next flush."
   [commit]
   (ptk/reify ::buffer-commit
     ptk/UpdateEvent
@@ -544,45 +541,39 @@
                         assoc ::acknowledged true))))
 
 (def ^:private rejected-tag
-  "Tag of the notice that rejected changes were undone."
+  "Tag of the rejected changes notice."
   :persistence-rejected)
 
 (defn- reverted-commits
-  "The pending commits to revert in each file, given the undo groups
-  already reverted (`groups`): in the saved file, from the first commit
-  the server rejected or the first one of a reverted group on; in the
-  others, from the first one of a reverted group on. Later commits of a
-  file often build on the reverted one, so they go too. The commits the
-  server kept (`kept`) are saved, never pending."
+  "Pending commits to revert per file: from the first one that is rejected
+  in `file-id`, or in an undo group of `groups`, to the last."
   [pending file-id rejected kept groups]
-  (into {}
-        (keep (fn [[fid commits]]
-                (when-let [i (d/index-of-pred commits
-                                              #(and (not (contains? kept (:id %)))
-                                                    (or (and (= fid file-id)
-                                                             (contains? rejected (:id %)))
-                                                        (contains? groups (:undo-group %)))))]
-                  [fid (subvec commits i)])))
-        pending))
+  (let [reverted?
+        (fn [fid {:keys [id undo-group]}]
+          (and (not (contains? kept id))
+               (or (and (= fid file-id) (contains? rejected id))
+                   (contains? groups undo-group))))
+
+        from-first-reverted
+        (fn [[fid commits]]
+          (when-let [i (d/index-of-pred commits (partial reverted? fid))]
+            [fid (subvec commits i)]))]
+    (into {} (keep from-first-reverted) pending)))
 
 (defn- rollback-plan
-  "How to roll back the save of the queue entry `entry`, which came back
-  with `rejected`. The unit is the undo group, one user action, which can
-  make commits in several files and several saves: reverting a commit
-  reverts its whole action, until no new undo group comes up.
+  "How to roll back the save of `entry` that came back `rejected`. Whole
+  undo groups are reverted, across files and saves.
 
-  For each file with commits to revert (`:files`), every pending commit is
-  undone, newest first; the remote changes that arrived after the oldest
-  of them are applied again, as the server applied them; then the pending
-  commits that stay are redone. Undo changes hold the values from before
-  each commit, so undoing only the reverted commits would overwrite a
-  peer's later change to the same attribute. Saved commits of a reverted
-  undo group go to `:compensate`: only a new commit can undo them."
+  Each file in `:files` undoes all its pending commits, applies again the
+  remote changes that came after them and redoes the commits that stay, so
+  a peer's later value for an attribute survives. Saved commits of a
+  reverted group go to `:compensate`, to be undone by a new commit."
   [pstate {:keys [file-id commits]} {:keys [commit-ids]}]
   (let [rejected  (set commit-ids)
         accepted  (into [] (remove #(contains? rejected (:id %))) commits)
         kept      (into #{} (map :id) accepted)
         pending   (into {} (map (juxt identity #(pending-commits pstate %))) (pending-files pstate))
+
         [reverted groups]
         (loop [groups #{}]
           (let [reverted (reverted-commits pending file-id rejected kept groups)
@@ -590,25 +581,27 @@
             (if (= groups groups')
               [reverted groups]
               (recur groups'))))
-        saved     (into (vec (:saved pstate)) (map #(assoc % :file-id file-id)) accepted)]
-    {:files      (into {}
-                       (map (fn [[fid commits]]
-                              (let [all   (get pending fid)
-                                    since (:remote-seq (first all) 0)]
-                                [fid {:undo     all
-                                      :remote   (into []
-                                                      (comp (filter #(> (:seq %) since))
-                                                            (mapcat :changes))
-                                                      (get-in pstate [:remote-changes fid]))
-                                      :redo     (subvec all 0 (- (count all) (count commits)))
-                                      :reverted commits}])))
-                       reverted)
+
+        saved     (into (vec (:saved pstate)) (map #(assoc % :file-id file-id)) accepted)
+
+        file-plan
+        (fn [[fid commits]]
+          (let [all       (get pending fid)
+                since     (:remote-seq (first all) 0)
+                xf:remote (comp (filter #(> (:seq %) since))
+                                (mapcat :changes))]
+            [fid {:undo     all
+                  :remote   (into [] xf:remote (get-in pstate [:remote-changes fid]))
+                  :redo     (subvec all 0 (- (count all) (count commits)))
+                  :reverted commits}]))]
+
+    {:files      (into {} (map file-plan) reverted)
      :compensate (into [] (filter #(contains? groups (:undo-group %))) saved)
      :groups     groups}))
 
 (defn- drop-commits
-  "Removes the commits with the given ids from the queue entries and the
-  buffer; an entry left without commits leaves the queue."
+  "Removes the commits in `ids` from the queue and the buffer; an entry left
+  empty leaves the queue."
   [pstate ids]
   (let [dropped? (comp ids :id)
         trim     (fn [{:keys [commits] :as entry}]
@@ -633,8 +626,7 @@
 
 (defn- compensate-commits
   "Commits the undo changes of the saved `commits` of `file-id`, newest
-  first: they belong to an action that was rejected, and the server keeps
-  them until a new commit undoes them."
+  first."
   [origin file-id commits]
   (dch/commit-changes {:origin origin
                        :file-id file-id
@@ -643,8 +635,8 @@
                        :undo-changes (into [] (mapcat :redo-changes) commits)}))
 
 (defn- prune-removed-shapes
-  "Deselects the shapes that no longer exist on the current page, and
-  leaves edition mode when the edited shape is one of them."
+  "Deselects the shapes missing from the current page and leaves edition
+  mode if the edited one is missing."
   []
   (ptk/reify ::prune-removed-shapes
     ptk/UpdateEvent
@@ -663,13 +655,10 @@
           (rx/empty))))))
 
 (defn- rollback-rejected
-  "The save of the queue entry `entry` kept its commits up to the first one
-  the server rejected. Reverts the rejected commits and every later commit
-  of the same file, and the rest of each action they belong to, in any
-  file: pending commits are undone and dropped from the queue and the
-  buffer, saved ones are undone by a new commit. Files go back to what the
-  server holds, the reverted actions leave the undo history, and the user
-  is told."
+  "Reverts the commits `rejected` in the save of `entry`, the later commits
+  of its file and the rest of their undo groups. Pending commits are undone
+  and dropped, saved ones undone by a new commit; the groups leave the undo
+  history and the user gets a warning."
   [{:keys [file-id] :as entry} rejected]
   (let [plan (volatile! nil)]
     (ptk/reify ::rollback-rejected
@@ -685,9 +674,7 @@
                   (fn [pstate]
                     (as-> pstate $
                       (drop-commits $ (into #{} (remove head) reverted))
-                      ;; The entry being saved leaves the queue once the save is
-                      ;; acknowledged; it must not remember commits that are not
-                      ;; saved, or that the compensation undoes, as saved.
+                      ;; The entry keeps only the commits that stay saved
                       (d/update-in-when $ [:index (:id entry) :commits]
                                         (fn [commits]
                                           (into [] (remove (comp unsaved :id)) commits)))
@@ -753,8 +740,8 @@
       :else                                                :ready)))
 
 (defn- with-changes
-  "Adds the changes of a queued commit to the save params: one group per
-  original commit, so the backend accepts or rejects each one."
+  "Adds the changes of a queued commit to the save params, one group per
+  commit so the backend can reject them one by one."
   [params {:keys [commits changes]}]
   (if (seq commits)
     (assoc params :changes-with-metadata
@@ -795,8 +782,7 @@
                       (if (and (int? revn) (<= 0 revn))
                         (rx/concat
                          (rx/of (update-file-revn file-id revn))
-                         ;; The server kept the commits before the rejected
-                         ;; one; the rest goes before the queue moves on.
+                         ;; Reverts the rejected commits before the queue moves on
                          (if (some? rejected)
                            (rx/of (rollback-rejected commit rejected))
                            (rx/empty))
@@ -1024,8 +1010,7 @@
 
            :else
            (rx/empty))
-         ;; Commits buffered by a previous session are queued now instead of
-         ;; waiting for the next edit.
+         ;; Queues the commits a previous session left buffered
          (if (seq buffer)
            (rx/of (flush-buffer))
            (rx/empty)))))))
@@ -1088,7 +1073,7 @@
   (mapcat :redo-changes))
 
 (def ^:private commit-keys
-  "What a queue entry keeps of each commit merged into it."
+  "Keys a queue entry keeps of each of its commits."
   [:id :origin :undo-group :redo-changes :undo-changes :remote-seq])
 
 (defn- merge-commit
@@ -1222,8 +1207,6 @@
               (rx/take-until stoper-s))
 
          ;; Syncs the leave-page warning on every buffer and queue change
-         ;; (a buffered commit, an append after a flush, a discard after a
-         ;; save, the release of a failed file).
          (->> (rx/merge
                (rx/of nil)
                (->> stream
@@ -1241,8 +1224,7 @@
                         (update-status :pending)))
               (rx/take-until stoper-s))
 
-         ;; Local commits wait in the store buffer and are queued in small
-         ;; chunks (commits very near in time) on each notification
+         ;; Buffers local commits; each notification queues the buffer
          (->> local-commits-s
               (rx/map buffer-commit)
               (rx/take-until stoper-s))
