@@ -157,3 +157,39 @@
     (t/testing "file-gc repairs nil pages and completes"
       (t/is (true? (th/run-task! :file-gc {:file-id file-id})))
       (t/is (true? (:has-media-trimmed (th/db-get :file {:id file-id})))))))
+
+(defn- corrupt-with-unknown-type
+  "Corruption no migration can heal: an unknown shape type. The file
+  must keep failing loudly instead of being silently rewritten."
+  [data page-id shape-id]
+  (assoc-in data [:pages-index page-id :objects shape-id :type] "triangle"))
+
+(t/deftest file-gc-returns-false-for-unfixable-file-without-half-tx
+  (let [profile (th/create-profile* 1)
+        file    (th/create-file* 1 {:profile-id (:id profile)
+                                    :project-id (:default-project-id profile)
+                                    :is-shared false})
+        file-id (setup-file-with-rect profile file)
+        file    (read-file file-id)
+        page-id (first (:pages (:data file)))
+        shape-id (first (remove #{uuid/zero}
+                                (filter uuid? (keys (get-in file [:pages-index page-id :objects])))))]
+
+    (-> (read-file file-id)
+        (update :data #(corrupt-with-unknown-type % page-id shape-id))
+        (persist-file))
+
+    ;; Force the read-time migration check: neither the normal path
+    ;; nor the explicit-migration fallback can fix an unknown type.
+    (th/db-delete! :file-migration {:file-id file-id})
+
+    (let [revn-before (:revn (th/db-get :file {:id file-id}))]
+      ;; The handler catches the migration failure and returns nil,
+      ;; like any other cleaning error: loud in Loki, retried by the
+      ;; scheduler, never half-persisted.
+      (t/testing "file-gc gives up cleanly on unfixable files"
+        (t/is (nil? (th/run-task! :file-gc {:file-id file-id})))
+        (t/is (false? (:has-media-trimmed (th/db-get :file {:id file-id})))
+              "file is not marked as trimmed")
+        (t/is (= revn-before (:revn (th/db-get :file {:id file-id})))
+              "no half transaction was persisted")))))

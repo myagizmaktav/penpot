@@ -14,6 +14,7 @@
    [app.binfile.common :as bfc]
    [app.common.files.changes :as cfc]
    [app.common.files.helpers :as cfh]
+   [app.common.files.migrations :as fmg]
    [app.common.files.repair :as cfr]
    [app.common.files.validate :as cfv]
    [app.common.logging :as l]
@@ -276,6 +277,40 @@
                :cause cause)
         {:file clean}))))
 
+(defn- read-file-with-explicit-migration
+  "Fallback read for files whose migrating read throws: reads without
+  migrating, sanitizes first so legacy migrations do not choke on
+  unconverted types, then migrates and persists explicitly, mirroring
+  what get-file does on the normal path."
+  [cfg {:keys [file-id] :as props}]
+  (when-let [file (bfc/get-file cfg file-id
+                                :realize? true
+                                :skip-locked? true
+                                :lock-for-update? true
+                                :migrate? false)]
+    (let [libs (delay (bfc/get-resolved-file-libraries cfg file))
+          file (-> file
+                   (update :data ctf/sanitize-file-data)
+                   (fmg/migrate-file libs))]
+      (bfc/update-file! cfg file)
+      (when (or (nil? (:revn props)) (= (:revn props) (:revn file)))
+        file))))
+
+(defn- read-file
+  "Reads the file holding the row lock. When the read fails for any
+  reason, retries once without migrations so the fallback can
+  sanitize and migrate explicitly: legacy migrations may choke on
+  unconverted types that sanitize-first then fixes. If the retry
+  also fails, the error reaches the handler as usual."
+  [cfg {:keys [file-id] :as props}]
+  (try
+    (get-file cfg props)
+    (catch Throwable cause
+      (l/trc :hint "retrying read with explicit migration"
+             :file-id (str file-id)
+             :cause cause)
+      (read-file-with-explicit-migration cfg props))))
+
 (defn- repair-and-persist
   "First transaction: read the file holding the row lock, run the
   semantic repair loop when validation reports errors, and persist the
@@ -287,13 +322,17 @@
                 (let [cfg (-> cfg
                               (update ::sto/storage sto/configure conn)
                               (assoc ::timestamp (ct/now)))]
-                  (when-let [file (get-file cfg props)]
+                  (if-let [file (read-file cfg props)]
                     (let [libs (->> (bfc/get-resolved-file-libraries cfg file)
                                     (realize-libraries cfg))
                           {:keys [file repaired?]} (repair-loop (-> file bfl/clean-file) libs)]
                       (when repaired?
                         (bfc/update-file! cfg file))
-                      file))))))
+                      file)
+                    (do
+                      (l/dbg :hint "skip cleaning, criteria does not match"
+                             :file-id (str (:file-id props)))
+                      nil))))))
 
 
 (defn- gc-file
