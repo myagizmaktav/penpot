@@ -130,9 +130,34 @@
   [components library-id {:keys [data]}]
   (filter #(ctf/used-in? data library-id % :component) components))
 
+(defn- get-library-user-ids
+  "Materialize the rows of the files using this one as a library with
+  a plain query (no cursor), so no write transaction needs to stay
+  open while their file data is loaded."
+  [cfg library-id]
+  (db/exec! cfg [sql:get-files-for-library library-id]))
+
+(defn- find-used-components
+  "Compute the set of deleted component ids still in use by library
+  users. Every user file is loaded on its own connection, outside any
+  write transaction. Skips the scan entirely when there is nothing
+  deleted to collect."
+  [cfg file deleted-components]
+  (if (seq deleted-components)
+    (let [file-id (:id file)
+          file-xform (mapcat (partial get-used-components deleted-components file-id))
+          library-xform (comp (map :id)
+                              (map #(bfc/get-file cfg % :realize? true :read-only? true))
+                              file-xform)]
+      (->> (get-library-user-ids cfg file-id)
+           (transduce library-xform conj #{})))
+    #{}))
+
 (defn- clean-deleted-components
-  "Performs the garbage collection of unreferenced deleted components."
-  [{:keys [::db/conn] :as cfg} {:keys [data] :as file}]
+  "Performs the garbage collection of unreferenced deleted components.
+  Takes the set of component ids still used by library users, computed
+  beforehand outside any write transaction."
+  [used-remote {:keys [data] :as file}]
   (let [file-id (:id file)
 
         deleted-components
@@ -140,16 +165,6 @@
 
         file-xform
         (mapcat (partial get-used-components deleted-components file-id))
-
-        library-xform
-        (comp
-         (map :id)
-         (map #(bfc/get-file cfg % :realize? true :read-only? true))
-         file-xform)
-
-        used-remote
-        (->> (db/plan conn [sql:get-files-for-library file-id] {:fetch-size 1})
-             (transduce library-xform conj #{}))
 
         used-local
         (into #{} file-xform [file])
@@ -200,9 +215,9 @@
     file))
 
 (defn- clean-media
-  [cfg file]
+  [cfg used-remote file]
   (let [file (->> file
-                  (clean-deleted-components cfg)
+                  (clean-deleted-components used-remote)
                   (clean-file-media cfg)
                   (clean-file-thumbnails cfg)
                   (clean-file-object-thumbnails cfg))]
@@ -337,12 +352,14 @@
 
 (defn- gc-file
   "Second transaction: re-read the file fresh, check nobody modified
-  it since the first transaction, and run the garbage collection."
-  [cfg {:keys [file-id revn]}]
+  it since the read phase, and run the garbage collection. Takes the
+  set of component ids still in use by library users, computed
+  beforehand outside any write transaction."
+  [cfg used-remote {:keys [file-id revn]}]
   (if-let [file (get-file cfg {:file-id file-id :revn revn})]
     (let [file (->> file
                     bfl/clean-file
-                    (clean-media cfg)
+                    (clean-media cfg used-remote)
                     (clean-fragments cfg))
           file (assoc file :has-media-trimmed true)]
       (bfc/update-file! cfg file)
@@ -353,15 +370,21 @@
       false)))
 
 (defn- gc-in-tx
-  "Second transaction: re-read the file fresh and run the garbage
-  collection. Returns true when the file was cleaned."
-  [cfg file-id revn]
-  (db/tx-run! cfg
-              (fn [{:keys [::db/conn] :as cfg}]
-                (let [cfg (-> cfg
-                              (update ::sto/storage sto/configure conn)
-                              (assoc ::timestamp (ct/now)))]
-                  (gc-file cfg {:file-id file-id :revn revn})))))
+  "Second transaction: run the garbage collection. Everything
+  expensive (loading the files that use this one as a library) happens
+  outside any write transaction; the write transaction itself only
+  re-reads with the row lock, checks nobody modified the file in the
+  meantime, applies the marks and commits. Returns true when the file
+  was cleaned."
+  [cfg {:keys [id revn] :as file}]
+  (let [used-remote (find-used-components cfg file
+                                          (ctkl/deleted-components-seq (:data file)))]
+    (db/tx-run! cfg
+                (fn [{:keys [::db/conn] :as cfg}]
+                  (let [cfg (-> cfg
+                                (update ::sto/storage sto/configure conn)
+                                (assoc ::timestamp (ct/now)))]
+                    (gc-file cfg used-remote {:file-id id :revn revn}))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; HANDLER
@@ -379,7 +402,7 @@
       (let [base-cfg   (assoc cfg ::db/rollback (:rollback? props))
             repaired   (repair-and-persist base-cfg props)
             processed? (when repaired
-                         (gc-in-tx base-cfg (:id repaired) (:revn repaired)))]
+                         (gc-in-tx base-cfg repaired))]
 
         (when (and processed? (contains? cf/flags :tiered-file-data-storage))
           (wrk/submit! (-> cfg

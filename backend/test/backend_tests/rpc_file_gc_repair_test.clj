@@ -112,6 +112,89 @@
                        :type :rect})}])
     (:id file)))
 
+(defn- instantiate-component
+  "Adds a copy of the library component to the given file."
+  [profile file library-id component-id]
+  (let [page-id  (first (:pages (:data file)))
+        shape-id (uuid/next)]
+    (apply-file-changes
+     :profile-id (:id profile)
+     :file-id (:id file)
+     :changes [{:type :add-obj
+                :page-id page-id
+                :id shape-id
+                :parent-id uuid/zero
+                :frame-id uuid/zero
+                :components-v2 true
+                :obj (cts/setup-shape
+                      {:id shape-id
+                       :name "Board"
+                       :frame-id uuid/zero
+                       :parent-id uuid/zero
+                       :type :frame
+                       :main-instance false
+                       :component-root true
+                       :component-file library-id
+                       :component-id component-id})}])
+    shape-id))
+
+(t/deftest file-gc-cleans-library-used-by-several-files
+  (let [profile (th/create-profile* 1)
+        library (th/create-file* 1 {:profile-id (:id profile)
+                                    :project-id (:default-project-id profile)
+                                    :is-shared true})
+        users   (mapv (fn [i]
+                        (th/create-file* i {:profile-id (:id profile)
+                                            :project-id (:default-project-id profile)
+                                            :is-shared false}))
+                      [2 3 4])
+        _       (doseq [user users]
+                  (th/link-file-to-library*
+                   {:file-id (:id user)
+                    :library-id (:id library)}))
+        s-id    (uuid/next)
+        c-id    (uuid/next)
+        lib-page-id (first (get-in library [:data :pages]))]
+
+    ;; Add a component to the library.
+    (apply-file-changes
+     :profile-id (:id profile)
+     :file-id (:id library)
+     :changes [{:type :add-obj
+                :page-id lib-page-id
+                :id s-id
+                :parent-id uuid/zero
+                :frame-id uuid/zero
+                :components-v2 true
+                :obj (cts/setup-shape
+                      {:id s-id
+                       :name "Board"
+                       :frame-id uuid/zero
+                       :parent-id uuid/zero
+                       :type :frame
+                       :main-instance true
+                       :component-root true
+                       :component-file (:id library)
+                       :component-id c-id})}
+               {:type :add-component
+                :path ""
+                :name "Board"
+                :main-instance-id s-id
+                :main-instance-page lib-page-id
+                :id c-id
+                :anotation nil}])
+
+    ;; Instantiate it in every user file.
+    (doseq [user users]
+      (instantiate-component profile user (:id library) c-id))
+
+    ;; The scan over library users must not hold a write transaction
+    ;; open (it used to hold a db/plan cursor while loading every
+    ;; user file, tripping idle-in-transaction timeouts in prod).
+    (t/testing "file-gc cleans a library used by several files"
+      (t/is (true? (th/run-task! :file-gc {:file-id (:id library)})))
+      (t/is (true? (:has-media-trimmed (th/db-get :file {:id (:id library)})))))))
+
 (t/deftest file-gc-repairs-unconverted-schema-types-before-cleaning
   (let [profile (th/create-profile* 1)
         file    (th/create-file* 1 {:profile-id (:id profile)
