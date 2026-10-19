@@ -281,11 +281,16 @@
               {:file clean})
 
             :else
-            (let [changes (cfr/repair-file file libs errors)]
-              (recur (-> file
-                         (update :revn inc)
-                         (update :data cfc/process-changes changes))
-                     (inc iteration))))))
+            (do
+              (l/trc :hint "repairing file"
+                     :file-id (str (:id file))
+                     :iteration iteration
+                     :errors (count errors))
+              (let [changes (cfr/repair-file file libs errors)]
+                (recur (-> file
+                           (update :revn inc)
+                           (update :data cfc/process-changes changes))
+                       (inc iteration)))))))
       (catch Throwable cause
         (l/wrn :hint "error on repairing file, cleaning as is"
                :file-id (str (:id clean))
@@ -400,9 +405,21 @@
   (fn [{:keys [props] :as task}]
     (try
       (let [base-cfg   (assoc cfg ::db/rollback (:rollback? props))
-            repaired   (repair-and-persist base-cfg props)
+            repaired   (try
+                         (repair-and-persist base-cfg props)
+                         (catch Throwable cause
+                           (l/err :hint "error on repairing file"
+                                  :file-id (str (:file-id props))
+                                  :cause cause)
+                           nil))
             processed? (when repaired
-                         (gc-in-tx base-cfg repaired))]
+                         (try
+                           (gc-in-tx base-cfg repaired)
+                           (catch Throwable cause
+                             (l/err :hint "error on cleaning file"
+                                    :file-id (str (:file-id props))
+                                    :cause cause)
+                             nil)))]
 
         (when (and processed? (contains? cf/flags :tiered-file-data-storage))
           (wrk/submit! (-> cfg
