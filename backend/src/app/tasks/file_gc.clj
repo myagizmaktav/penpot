@@ -12,7 +12,9 @@
   (:require
    [app.binfile.cleaner :as bfl]
    [app.binfile.common :as bfc]
+   [app.common.files.changes :as cfc]
    [app.common.files.helpers :as cfh]
+   [app.common.files.repair :as cfr]
    [app.common.files.validate :as cfv]
    [app.common.logging :as l]
    [app.common.thumbnails :as thc]
@@ -25,6 +27,7 @@
    [app.features.fdata :as feat.fdata]
    [app.features.file-snapshots :as fsnap]
    [app.storage :as sto]
+   [app.util.pointer-map :as pmap]
    [app.worker :as wrk]
    [integrant.core :as ig]))
 
@@ -41,7 +44,7 @@
    (map :data)
    (mapcat cfh/collect-used-media)))
 
-(defn- clean-file-media!
+(defn- clean-file-media
   "Performs the garbage collection of file media objects."
   [{:keys [::db/conn ::timestamp] :as cfg} {:keys [id] :as file}]
   (let [used-media
@@ -70,7 +73,7 @@
     WHERE file_id = ? AND object_id != ALL(?::text[])
    RETURNING object_id")
 
-(defn- clean-file-object-thumbnails!
+(defn- clean-file-object-thumbnails
   [{:keys [::db/conn ::timestamp]} {:keys [data] :as file}]
   (let [file-id (:id file)
         using   (->> (vals (:pages-index data))
@@ -100,7 +103,7 @@
     WHERE file_id = ? AND revn < ?
    RETURNING revn")
 
-(defn- clean-file-thumbnails!
+(defn- clean-file-thumbnails
   [{:keys [::db/conn ::timestamp]} {:keys [id revn] :as file}]
   (let [unused (->> (db/exec! conn [sql:mark-file-thumbnails-deleted timestamp id revn])
                     (into #{} (map :revn)))]
@@ -126,7 +129,7 @@
   [components library-id {:keys [data]}]
   (filter #(ctf/used-in? data library-id % :component) components))
 
-(defn- clean-deleted-components!
+(defn- clean-deleted-components
   "Performs the garbage collection of unreferenced deleted components."
   [{:keys [::db/conn] :as cfg} {:keys [data] :as file}]
   (let [file-id (:id file)
@@ -181,7 +184,7 @@
   (comp (map :data)
         (mapcat feat.fdata/get-used-pointer-ids)))
 
-(defn- clean-fragments!
+(defn- clean-fragments
   [{:keys [::db/conn ::timestamp]} {:keys [id] :as file}]
   (let [used   (into #{} xf:collect-pointers [file])
         unused (->> (db/exec! conn [sql:mark-deleted-data-fragments timestamp id
@@ -195,13 +198,13 @@
 
     file))
 
-(defn- clean-media!
+(defn- clean-media
   [cfg file]
   (let [file (->> file
-                  (clean-deleted-components! cfg)
-                  (clean-file-media! cfg)
-                  (clean-file-thumbnails! cfg)
-                  (clean-file-object-thumbnails! cfg))]
+                  (clean-deleted-components cfg)
+                  (clean-file-media cfg)
+                  (clean-file-thumbnails cfg)
+                  (clean-file-object-thumbnails cfg))]
     (cfv/validate-file-schema! file)
     file))
 
@@ -221,13 +224,87 @@
 ;; FIXME: we should skip files that does not match the revn on the
 ;; props and add proper schema for this task props
 
-(defn- process-file!
-  [cfg {:keys [file-id] :as props}]
-  (if-let [file (get-file cfg props)]
+(defn- realize-libraries
+  "Realize every library up front. Validation dereferences library
+  data on copy checks, and pointers are file-local, hence each library
+  is realized with its own loader bound. This mirrors what
+  clean-deleted-components already does per library file."
+  [cfg libraries]
+  (into {}
+        (map (fn [[id lib]]
+               [id (binding [pmap/*load-fn* (partial feat.fdata/load-pointer cfg id)
+                             pmap/*tracked* (pmap/create-tracked)]
+                     (feat.fdata/realize cfg lib))]))
+        libraries))
+
+(defn- repair-loop
+  "Runs the semantic repair loop over an in-memory file. Repair is
+  best-effort: when it throws or does not converge, the original file
+  is returned untouched so the garbage collection still runs as
+  before."
+  [file libs]
+  (let [clean file]
+    (try
+      (loop [file clean
+             iteration 0]
+        (let [errors (not-empty (cfv/validate-file file libs))]
+          (cond
+            (empty? errors)
+            (do
+              (when (pos? iteration)
+                (l/trc :hint "file repaired"
+                       :file-id (str (:id file))
+                       :iterations iteration))
+              {:file file :repaired? (pos? iteration)})
+
+            (>= iteration 10)
+            (do
+              (l/wrn :hint "file still invalid after repair, cleaning as is"
+                     :file-id (str (:id file))
+                     :errors (count errors))
+              {:file clean})
+
+            :else
+            (let [changes (cfr/repair-file file libs errors)]
+              (recur (-> file
+                         (update :revn inc)
+                         (update :data cfc/process-changes changes))
+                     (inc iteration))))))
+      (catch Throwable cause
+        (l/wrn :hint "error on repairing file, cleaning as is"
+               :file-id (str (:id clean))
+               :cause cause)
+        {:file clean}))))
+
+(defn- repair-and-persist
+  "First transaction: read the file holding the row lock, run the
+  semantic repair loop when validation reports errors, and persist the
+  repaired file. Returns the file to clean, or nil when the file
+  cannot even be read."
+  [cfg props]
+  (db/tx-run! cfg
+              (fn [{:keys [::db/conn] :as cfg}]
+                (let [cfg (-> cfg
+                              (update ::sto/storage sto/configure conn)
+                              (assoc ::timestamp (ct/now)))]
+                  (when-let [file (get-file cfg props)]
+                    (let [libs (->> (bfc/get-resolved-file-libraries cfg file)
+                                    (realize-libraries cfg))
+                          {:keys [file repaired?]} (repair-loop (-> file bfl/clean-file) libs)]
+                      (when repaired?
+                        (bfc/update-file! cfg file))
+                      file))))))
+
+
+(defn- gc-file
+  "Second transaction: re-read the file fresh, check nobody modified
+  it since the first transaction, and run the garbage collection."
+  [cfg {:keys [file-id revn]}]
+  (if-let [file (get-file cfg {:file-id file-id :revn revn})]
     (let [file (->> file
-                    (bfl/clean-file)
-                    (clean-media! cfg)
-                    (clean-fragments! cfg))
+                    bfl/clean-file
+                    (clean-media cfg)
+                    (clean-fragments cfg))
           file (assoc file :has-media-trimmed true)]
       (bfc/update-file! cfg file)
       true)
@@ -235,6 +312,17 @@
     (do
       (l/dbg :hint "skip cleaning, criteria does not match" :file-id (str file-id))
       false)))
+
+(defn- gc-in-tx
+  "Second transaction: re-read the file fresh and run the garbage
+  collection. Returns true when the file was cleaned."
+  [cfg file-id revn]
+  (db/tx-run! cfg
+              (fn [{:keys [::db/conn] :as cfg}]
+                (let [cfg (-> cfg
+                              (update ::sto/storage sto/configure conn)
+                              (assoc ::timestamp (ct/now)))]
+                  (gc-file cfg {:file-id file-id :revn revn})))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; HANDLER
@@ -249,21 +337,18 @@
   [_ cfg]
   (fn [{:keys [props] :as task}]
     (try
-      (-> cfg
-          (assoc ::db/rollback (:rollback? props))
-          (db/tx-run! (fn [{:keys [::db/conn] :as cfg}]
-                        (let [cfg        (-> cfg
-                                             (update ::sto/storage sto/configure conn)
-                                             (assoc ::timestamp (ct/now)))
-                              processed? (process-file! cfg props)]
+      (let [base-cfg   (assoc cfg ::db/rollback (:rollback? props))
+            repaired   (repair-and-persist base-cfg props)
+            processed? (when repaired
+                         (gc-in-tx base-cfg (:id repaired) (:revn repaired)))]
 
-                          (when (and processed? (contains? cf/flags :tiered-file-data-storage))
-                            (wrk/submit! (-> cfg
-                                             (assoc ::wrk/task :offload-file-data)
-                                             (assoc ::wrk/params props)
-                                             (assoc ::wrk/priority 10)
-                                             (assoc ::wrk/delay 1000))))
-                          processed?))))
+        (when (and processed? (contains? cf/flags :tiered-file-data-storage))
+          (wrk/submit! (-> cfg
+                           (assoc ::wrk/task :offload-file-data)
+                           (assoc ::wrk/params props)
+                           (assoc ::wrk/priority 10)
+                           (assoc ::wrk/delay 1000))))
+        processed?)
       (catch Throwable cause
         (l/err :hint "error on cleaning file"
                :file-id (str (:file-id props))

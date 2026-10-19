@@ -127,7 +127,7 @@
 
     ;; Pin the failure cause: the persisted file is schema-invalid.
     (t/is (thrown-with-msg? clojure.lang.ExceptionInfo #"invalid file data"
-            (cfv/validate-file-schema! (read-file file-id))))
+                            (cfv/validate-file-schema! (read-file file-id))))
 
     ;; The file reads fine (no migration pending) but must fail at
     ;; clean-media validation until the repair is implemented.
@@ -153,7 +153,7 @@
 
     ;; Pin the failure cause: the file no longer even reads.
     (t/is (thrown-with-msg? clojure.lang.ExceptionInfo #"invalid file data"
-            (read-file file-id)))
+                            (read-file file-id)))
 
     (t/testing "file-gc repairs nil pages and completes"
       (t/is (true? (th/run-task! :file-gc {:file-id file-id})))
