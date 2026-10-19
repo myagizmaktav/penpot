@@ -856,6 +856,10 @@
   (let [page (if (and (string? name) (uuid? id))
                (ctp/make-empty-page {:id id :name name})
                page)]
+    ;; A page without a valid id would leave a nil entry in :pages
+    ;; and a nil key in :pages-index (see legacy-57); fail fast
+    ;; instead, like del-page already does.
+    (assert (uuid? (:id page)) "add-page requires a page with a valid :id")
     (ctpl/add-page data page)))
 
 (defmethod process-change :mod-page
