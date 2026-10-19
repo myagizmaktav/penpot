@@ -857,9 +857,13 @@
                (ctp/make-empty-page {:id id :name name})
                page)]
     ;; A page without a valid id would leave a nil entry in :pages
-    ;; and a nil key in :pages-index (see legacy-57); fail fast
-    ;; instead, like del-page already does.
-    (assert (uuid? (:id page)) "add-page requires a page with a valid :id")
+    ;; and a nil key in :pages-index (see legacy-57). Fail fast with
+    ;; a structured error instead of assert: asserts are elided in
+    ;; release CLJS builds, and this must hold there too.
+    (when-not (uuid? (:id page))
+      (ex/raise :type :validation
+                :hint "add-page requires a page with a valid :id"
+                :page-id (:id page)))
     (ctpl/add-page data page)))
 
 (defmethod process-change :mod-page

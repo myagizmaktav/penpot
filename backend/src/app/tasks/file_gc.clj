@@ -12,6 +12,7 @@
   (:require
    [app.binfile.cleaner :as bfl]
    [app.binfile.common :as bfc]
+   [app.common.exceptions :as ex]
    [app.common.files.changes :as cfc]
    [app.common.files.helpers :as cfh]
    [app.common.files.migrations :as fmg]
@@ -155,14 +156,12 @@
 
 (defn- clean-deleted-components
   "Performs the garbage collection of unreferenced deleted components.
-  Takes the set of component ids still used by library users, computed
-  beforehand outside any write transaction."
-  [used-remote {:keys [data] :as file}]
-  (let [file-id (:id file)
-
-        deleted-components
-        (ctkl/deleted-components-seq data)
-
+  Takes the set of component ids still used by library users and the
+  deleted components, both computed beforehand outside any write
+  transaction. Both stay valid under the revn guard: if the file
+  changed in between, Tx2 aborts before using them."
+  [used-remote deleted-components {:keys [id] :as file}]
+  (let [file-id id
         file-xform
         (mapcat (partial get-used-components deleted-components file-id))
 
@@ -215,9 +214,9 @@
     file))
 
 (defn- clean-media
-  [cfg used-remote file]
+  [cfg used-remote deleted-components file]
   (let [file (->> file
-                  (clean-deleted-components used-remote)
+                  (clean-deleted-components used-remote deleted-components)
                   (clean-file-media cfg)
                   (clean-file-thumbnails cfg)
                   (clean-file-object-thumbnails cfg))]
@@ -321,21 +320,33 @@
   reason, retries once without migrations so the fallback can
   sanitize and migrate explicitly: legacy migrations may choke on
   unconverted types that sanitize-first then fixes. If the retry
-  also fails, the error reaches the handler as usual."
+  also fails, the original cause is chained so the handler log shows
+  both failures instead of only the second one."
   [cfg {:keys [file-id] :as props}]
   (try
     (get-file cfg props)
-    (catch Throwable cause
+    (catch Throwable original
       (l/trc :hint "retrying read with explicit migration"
              :file-id (str file-id)
-             :cause cause)
-      (read-file-with-explicit-migration cfg props))))
+             :cause original)
+      (try
+        (read-file-with-explicit-migration cfg props)
+        (catch Throwable retry-cause
+          (ex/raise :type :internal
+                    :hint "file-gc read failed after explicit migration retry"
+                    :file-id (str file-id)
+                    :phase :tx1-read
+                    :retry-cause retry-cause
+                    :cause original))))))
 
 (defn- repair-and-persist
   "First transaction: read the file holding the row lock, run the
-  semantic repair loop when validation reports errors, and persist the
-  repaired file. Returns the file to clean, or nil when the file
-  cannot even be read."
+  semantic repair loop when validation reports errors, check the
+  schema of the result and persist it when it was repaired. A file
+  that is still schema-invalid after the repair fails here (instead
+  of at the end of the second transaction), so it is never marked as
+  cleaned. Returns the file to clean, or nil when the file cannot be
+  read or repaired."
   [cfg props]
   (db/tx-run! cfg
               (fn [{:keys [::db/conn] :as cfg}]
@@ -343,12 +354,19 @@
                               (update ::sto/storage sto/configure conn)
                               (assoc ::timestamp (ct/now)))]
                   (if-let [file (read-file cfg props)]
-                    (let [libs (->> (bfc/get-resolved-file-libraries cfg file)
-                                    (realize-libraries cfg))
-                          {:keys [file repaired?]} (repair-loop (-> file bfl/clean-file) libs)]
-                      (when repaired?
-                        (bfc/update-file! cfg file))
-                      file)
+                    (try
+                      (let [libs (->> (bfc/get-resolved-file-libraries cfg file)
+                                      (realize-libraries cfg))
+                            {:keys [file repaired?]} (repair-loop (-> file bfl/clean-file) libs)]
+                        (cfv/validate-file-schema! file)
+                        (when repaired?
+                          (bfc/update-file! cfg file))
+                        file)
+                      (catch Throwable cause
+                        (l/err :hint "error on repairing file"
+                               :file-id (str (:file-id props))
+                               :cause cause)
+                        nil))
                     (do
                       (l/dbg :hint "skip cleaning, criteria does not match"
                              :file-id (str (:file-id props)))
@@ -358,13 +376,13 @@
 (defn- gc-file
   "Second transaction: re-read the file fresh, check nobody modified
   it since the read phase, and run the garbage collection. Takes the
-  set of component ids still in use by library users, computed
-  beforehand outside any write transaction."
-  [cfg used-remote {:keys [file-id revn]}]
+  set of component ids still in use by library users and the deleted
+  components, both computed beforehand outside any write transaction."
+  [cfg used-remote deleted-components {:keys [file-id revn]}]
   (if-let [file (get-file cfg {:file-id file-id :revn revn})]
     (let [file (->> file
                     bfl/clean-file
-                    (clean-media cfg used-remote)
+                    (clean-media cfg used-remote deleted-components)
                     (clean-fragments cfg))
           file (assoc file :has-media-trimmed true)]
       (bfc/update-file! cfg file)
@@ -381,15 +399,15 @@
   re-reads with the row lock, checks nobody modified the file in the
   meantime, applies the marks and commits. Returns true when the file
   was cleaned."
-  [cfg {:keys [id revn] :as file}]
-  (let [used-remote (find-used-components cfg file
-                                          (ctkl/deleted-components-seq (:data file)))]
+  [cfg {:keys [id revn data] :as file}]
+  (let [deleted-components (ctkl/deleted-components-seq data)
+        used-remote (find-used-components cfg file deleted-components)]
     (db/tx-run! cfg
                 (fn [{:keys [::db/conn] :as cfg}]
                   (let [cfg (-> cfg
                                 (update ::sto/storage sto/configure conn)
                                 (assoc ::timestamp (ct/now)))]
-                    (gc-file cfg used-remote {:file-id id :revn revn}))))))
+                    (gc-file cfg used-remote deleted-components {:file-id id :revn revn}))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; HANDLER

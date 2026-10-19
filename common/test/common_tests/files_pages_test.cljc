@@ -34,11 +34,15 @@
 
 (t/deftest add-page-without-id-is-rejected
   (let [file (thf/sample-file :file)]
-    (t/is (thrown? #?(:clj AssertionError :cljs js/Error)
-                   (thf/apply-changes file
-                                      {:redo-changes [{:type :add-page :page {:name "Ghost"}}]}
-                                      :validate? false))
-          "add-page without a valid page id fails fast instead of storing nil")))
+    (try
+      (thf/apply-changes file
+                         {:redo-changes [{:type :add-page :page {:name "Ghost"}}]}
+                         :validate? false)
+      (t/is false "expected exception to be thrown")
+      (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo) e
+        (let [data (ex-data e)]
+          (t/is (= :validation (:type data)))
+          (t/is (= "add-page requires a page with a valid :id" (ex-message e))))))))
 
 (t/deftest mov-page-with-nil-id-is-rejected-at-change-level
   (let [file (thf/sample-file :file)]
