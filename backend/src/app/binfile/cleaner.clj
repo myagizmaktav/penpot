@@ -10,6 +10,7 @@
   (:require
    [app.common.data :as d]
    [app.common.svg :as csvg]
+   [app.common.types.file :as ctf]
    [app.common.types.shape :as cts]
    [app.common.uuid :as uuid]))
 
@@ -139,4 +140,8 @@
             (-> data
                 (d/update-when :pages-index d/update-vals fix-container)
                 (d/update-when :components d/update-vals fix-container)
-                (d/without-nils)))))
+                (d/without-nils)
+                ;; Defensive pass for corruption that arrived after the
+                ;; 0027 migration already ran (update-file! does not
+                ;; validate on write). Same recipe as the migration.
+                (ctf/sanitize-file-data)))))

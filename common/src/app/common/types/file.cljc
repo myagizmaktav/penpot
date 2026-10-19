@@ -130,6 +130,37 @@
 (def check-file-data
   (sm/check-fn schema:data :hint "invalid file data"))
 
+(defn sanitize-file-data
+  "Decode file data with the file schema and drop nil page entries,
+  repairing the two corruption families seen in production: types
+  left unconverted by decoders (strings or keywords where the schema
+  expects keywords or uuids) and nil page entries that reappeared
+  after legacy-57. The schema itself drives the coercions
+  (`:decode/json` on shape types, json-transformer uuid decoders), so
+  there is no hand-rolled type table to keep in sync. Component
+  objects need an explicit pass because the container schema declares
+  them opaque (`:map`), so the top-level decode does not descend into
+  them. Total and idempotent: unknown or invalid values are left
+  untouched, so files with real corruption keep failing loudly
+  instead of being silently rewritten."
+  [data]
+  (let [data (-> data
+                 (update :pages (fn [pages] (into [] (remove nil?) pages)))
+                 (update :pages-index dissoc nil))]
+    (-> (sm/decode schema:data data (sm/json-transformer))
+        ;; The container schema declares :objects opaque (:map), so
+        ;; the top-level decode does not descend into component
+        ;; shapes. Decode them explicitly with the page objects
+        ;; schema, which carries the same shape decoders.
+        (d/update-when :components (fn [components]
+                                     (d/update-vals components
+                                                    (fn [component]
+                                                      (d/update-when component :objects
+                                                                     (fn [objects]
+                                                                       (sm/decode ctp/schema:objects
+                                                                                  objects
+                                                                                  (sm/json-transformer)))))))))))
+
 (def check-file-media
   (sm/check-fn schema:media))
 

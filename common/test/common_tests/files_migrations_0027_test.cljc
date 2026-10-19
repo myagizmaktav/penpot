@@ -16,6 +16,7 @@
   what still needs targeted repair clauses. They assert observed
   behavior, not fixed behavior."
   (:require
+   [app.common.files.migrations :as cfm]
    [app.common.schema :as sm]
    [app.common.types.file :as ctf]
    [app.common.types.shape :as cts]
@@ -129,3 +130,128 @@
     (t/is (contains? (:pages-index decoded) page-id) "decode preserves page keys")
     (t/is (some? (ctf/check-file-data (assoc decoded :id (uuid/next))))
           "decoded healthy data stays valid")))
+
+(defn- corrupt-shape-types
+  "Mirrors production files: shape type as text, ids as text and
+  object/page-map keys as text/keyword instead of uuid."
+  [data]
+  (letfn [(corrupt-shape [shape]
+            (-> shape
+                (assoc :type (name (:type shape)))
+                (assoc :id (str (:id shape)))
+                (update :parent-id str)
+                (update :frame-id str)))
+          (corrupt-objects [objects]
+            (into {}
+                  (map (fn [[id shape]]
+                         [(keyword (str id)) (corrupt-shape shape)]))
+                  objects))
+          (corrupt-page [[page-id page]]
+            [(str page-id) (update page :objects corrupt-objects)])]
+    (-> data
+        (update :pages (fn [pages] (mapv str pages)))
+        (update :pages-index (fn [pages-index]
+                               (into {} (map corrupt-page) pages-index))))))
+
+(defn- valid-shape?
+  [data page-id shape-id]
+  (let [shape (get-in data [:pages-index page-id :objects shape-id])]
+    (and (= :rect (:type shape))
+         (uuid? (:id shape))
+         (uuid? (:parent-id shape))
+         (uuid? (:frame-id shape)))))
+
+(t/deftest migration-0027-converts-unconverted-types-in-pages
+  (let [page-id  (uuid/next)
+        shape-id (uuid/next)
+        data     (-> (make-data page-id (make-rect-shape shape-id))
+                     (corrupt-shape-types)
+                     (assoc :custom-attr "kept"))
+        data'    (cfm/migrate-data data "0027-repair-unconverted-types-and-nil-pages")
+        shape    (get-in data' [:pages-index page-id :objects shape-id])]
+    (t/is (valid-shape? data' page-id shape-id) "types and ids converted back")
+    (t/is (contains? (:pages-index data') page-id) "page key converted back")
+    (t/is (= [page-id] (:pages data')) "page refs converted back")
+    (t/is (= "kept" (:custom-attr data')) "unknown keys preserved")
+    (t/is (some? (ctf/check-file-data (assoc data' :id (uuid/next))))
+          "migrated data validates")))
+
+(t/deftest migration-0027-converts-unconverted-types-in-components
+  (let [page-id      (uuid/next)
+        shape-id     (uuid/next)
+        component-id (uuid/next)
+        data         {:pages-index
+                      {page-id {:id page-id
+                                :name "Page 1"
+                                :objects {uuid/zero (make-root-shape page-id)}}}
+                      :components
+                      {(str component-id) {:id (str component-id)
+                                           :name "Component"
+                                           :objects {shape-id (make-rect-shape shape-id)}}}}
+        data         (-> data
+                         (update-in [:components (str component-id) :objects]
+                                    (fn [objects]
+                                      (into {}
+                                            (map (fn [[id shape]]
+                                                   [(keyword (str id))
+                                                    (-> shape
+                                                        (assoc :type (name (:type shape)))
+                                                        (assoc :id (str (:id shape))))]))
+                                            objects))))
+        data'        (cfm/migrate-data data "0027-repair-unconverted-types-and-nil-pages")
+        shape        (get-in data' [:components component-id :objects shape-id])]
+    (t/is (= :rect (:type shape)) "component shape type converted")
+    (t/is (uuid? (:id shape)) "component shape id converted")
+    (t/is (contains? (:components data') component-id) "component key converted")
+    (t/is (= component-id (get-in data' [:components component-id :id]))
+          "component id converted")
+    (t/is (contains? (get-in data' [:components component-id :objects]) shape-id)
+          "component object key converted")))
+
+(t/deftest migration-0027-drops-nil-pages
+  (let [page-id  (uuid/next)
+        shape-id (uuid/next)
+        data     (-> (make-data page-id (make-rect-shape shape-id))
+                     (update :pages conj nil)
+                     (assoc-in [:pages-index nil]
+                               {:id nil :name "ghost" :objects {}}))
+        data'    (cfm/migrate-data data "0027-repair-unconverted-types-and-nil-pages")]
+    (t/is (not-any? nil? (:pages data')) "nil page refs removed")
+    (t/is (not (contains? (:pages-index data') nil)) "nil page key removed")
+    (t/is (some? (ctf/check-file-data (assoc data' :id (uuid/next))))
+          "migrated data validates")))
+
+(t/deftest migration-0027-leaves-valid-data-untouched
+  (let [page-id  (uuid/next)
+        shape-id (uuid/next)
+        data     (assoc (make-data page-id (make-rect-shape shape-id))
+                        :id (uuid/next))
+        data'    (cfm/migrate-data data "0027-repair-unconverted-types-and-nil-pages")]
+    (t/is (some? (ctf/check-file-data data')) "healthy data stays valid")))
+
+(t/deftest migration-0027-is-idempotent
+  (let [page-id  (uuid/next)
+        shape-id (uuid/next)
+        data     (-> (make-data page-id (make-rect-shape shape-id))
+                     (corrupt-shape-types))
+        data'    (cfm/migrate-data data "0027-repair-unconverted-types-and-nil-pages")
+        data''   (cfm/migrate-data data' "0027-repair-unconverted-types-and-nil-pages")]
+    (t/is (= data' data'') "second run is a no-op")))
+
+(t/deftest migration-0027-runs-through-migrate
+  (let [file-id  (uuid/next)
+        page-id  (uuid/next)
+        shape-id (uuid/next)
+        data     (-> (make-data page-id (make-rect-shape shape-id))
+                     (corrupt-shape-types))
+        file     {:id file-id
+                  :features #{}
+                  :migrations (disj cfm/available-migrations
+                                    "0027-repair-unconverted-types-and-nil-pages")
+                  :data data}
+        file'    (cfm/migrate file nil)]
+    ;; migrate itself validates at the end, so returning is passing.
+    (t/is (contains? (:migrations file') "0027-repair-unconverted-types-and-nil-pages")
+          "migration marked as applied")
+    (t/is (valid-shape? (:data file') page-id shape-id)
+          "migrated file data has converted types")))

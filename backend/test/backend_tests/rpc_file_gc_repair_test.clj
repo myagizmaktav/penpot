@@ -151,9 +151,8 @@
     ;; get-file/migrate-file before cleaning ever starts.
     (th/db-delete! :file-migration {:file-id file-id})
 
-    ;; Pin the failure cause: the file no longer even reads.
-    (t/is (thrown-with-msg? clojure.lang.ExceptionInfo #"invalid file data"
-                            (read-file file-id)))
+    ;; Since the 0027 migration heals nil pages, the read now
+    ;; succeeds where it used to throw invalid file data.
 
     (t/testing "file-gc repairs nil pages and completes"
       (t/is (true? (th/run-task! :file-gc {:file-id file-id})))
