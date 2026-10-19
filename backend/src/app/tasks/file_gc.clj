@@ -238,16 +238,14 @@
                      current))]
     (-> file
         (assoc :data
-               (let [data (reduce-kv (fn [m k v]
-                                       (assoc m k (reattach v (get-in original [:root k]))))
-                                     data
-                                     data)]
-                 (update data :pages-index
-                         (fn [pages]
-                           (reduce-kv (fn [m pid v]
-                                        (assoc m pid (reattach v (get-in original [:pages pid]))))
-                                      (or pages {})
-                                      (or pages {})))))))))
+               (let [data' (into {} (map (fn [[k v]]
+                                           [k (reattach v (get-in original [:root k]))]))
+                                 data)
+                     pages (or (:pages-index data') {})]
+                 (assoc data' :pages-index
+                        (into {} (map (fn [[pid v]]
+                                        [pid (reattach v (get-in original [:pages pid]))]))
+                              pages)))))))
 
 (defn- clean-fragments!
   "Mark fragment rows referenced neither by the current main file data
@@ -342,9 +340,12 @@
                             processed? (process-file! cfg params)]
 
                         (when (and processed? (contains? cf/flags :tiered-file-data-storage))
+                          ;; Pass only the file id: the offload job ignores
+                          ;; any other file-gc param, and forwarding the whole
+                          ;; map would silently couple the two jobs.
                           (jobs/submit cfg
                                        {::jobs/name :offload-file-data
-                                        ::jobs/params params
+                                        ::jobs/params {:file-id (:file-id params)}
                                         ::jobs/priority 10
                                         ::jobs/delay 1000}))
                         processed?))))

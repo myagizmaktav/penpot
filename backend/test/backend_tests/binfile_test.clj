@@ -2904,7 +2904,9 @@
   ;; Locking is incompatible with `load-data? false`: the guard fires
   ;; before any query, so no DB row is needed. Regression test for the
   ;; `lock-for-share?`/`lock-for-share?` typo that left `lock-for-update?`
-  ;; unchecked.
+  ;; unchecked. NOTE: the guard is a plain `assert`, which only exists in
+  ;; compiled code with `PENPOT_FLAGS=enable-backend-asserts` (exported by
+  ;; `scripts/ci` and CI) — without the flag this test passes vacuously.
   (doseq [opt [:lock-for-share? :lock-for-update? :skip-locked?]]
     (t/is (thrown? IllegalArgumentException
                    (bfc/get-file th/*system* (uuid/random)

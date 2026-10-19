@@ -17,6 +17,7 @@
    [app.features.fdata :as fdata]
    [app.features.file-snapshots :as fsnap]
    [app.rpc :as-alias rpc]
+   [app.util.blob :as blob]
    [app.util.pointer-map :as pmap]
    [backend-tests.helpers :as th]
    [clojure.test :as t]))
@@ -437,4 +438,87 @@
       (t/is (contains? @pmap/*tracked* (pmap/get-id wrapped)))
       (t/is (contains? @pmap/*tracked* (pmap/get-id unloaded)))
       (t/is (= {:a 1} @wrapped))
-      (t/is (thrown? UnsupportedOperationException @unloaded)))))
+      (t/is (thrown? UnsupportedOperationException @unloaded))))) \n
+(t/deftest legacy-snapshot-does-not-break-liveness
+  ;; Snapshots written before the feature carry materialized data in
+  ;; file_change.data (backend "legacy-db") instead of a file_data row.
+  ;; file-gc must scan them without failing, and the legacy preview must
+  ;; still resolve. Setup pins the legacy shape: file_change row with
+  ;; data, no file_data snapshot row.
+  (let [profile (th/create-profile* 1)
+        file    (th/create-file* 1 {:profile-id (:id profile)
+                                    :project-id (:default-project-id profile)
+                                    :is-shared false})
+        file-id (:id file)
+        f0      (bfc/get-file th/*system* file-id)
+        page-id (first (:pages (:data f0)))]
+    (update-file! :profile-id (:id profile)
+                  :file-id file-id
+                  :revn 0
+                  :changes (add-rect-change page-id (uuid/random)))
+    ;; Drop every snapshot row so only the manual one below exists.
+    (th/db-delete! :file-change {:file-id file-id})
+    (th/db-delete! :file-data {:file-id file-id :type "snapshot"})
+    (let [f1       (bfc/get-file th/*system* file-id)
+          snap     (fsnap/create! th/*system* f1 {:profile-id (:id profile)})
+          snap-id  (:id snap)
+          realized (:data (fdata/realize th/*system* {:id file-id :data (:data (fsnap/get-snapshot th/*system* file-id snap-id))}))]
+      ;; Convert to the legacy shape: materialize into file_change.data,
+      ;; drop the file_data snapshot row.
+      (th/db-delete! :file-data {:file-id file-id :type "snapshot"})
+      (th/db-update! :file-change {:data (blob/encode realized)} {:id snap-id})
+      ;; Pin the legacy shape: data on file_change, no file_data row.
+      ;; (db-get filters rows with deleted_at set, and system snapshots
+      ;; carry a future one, so opt out of that filter explicitly.)
+      (t/is (nil? (seq (th/db-query :file-data {:file-id file-id :type "snapshot"}))))
+      (t/is (some? (:data (th/db-get :file-change {:id snap-id} {::db/remove-deleted false})))))
+    ;; file-gc scans the legacy snapshot without failing...
+    (t/is (true? (th/run-task! :file-gc {:file-id file-id})))
+    ;; ...the live file still resolves fully...
+    (let [live (:data (bfc/get-file th/*system* file-id :realize? true))]
+      (t/is (empty? (fdata/get-used-pointer-ids live))))
+    ;; ...and the legacy preview resolves with no leftover pointers.
+    (let [snap-data (:data (fsnap/get-snapshot th/*system* file-id
+                                               (->> (th/db-query :file-change {:file-id file-id})
+                                                    (filter #(some? (:data %)))
+                                                    (first)
+                                                    (:id))))]
+      (t/is (some? snap-data))
+      (t/is (empty? (fdata/get-used-pointer-ids snap-data))))))
+
+(t/deftest offload-edit-gc-cycle-keeps-liveness
+  ;; Full cycle on one file: offload to cold storage, edit (which brings
+  ;; rows back hot), file-gc. Liveness must stay correct throughout and
+  ;; the file must resolve fully at the end. (R1's fix is what lets
+  ;; metadata-bearing files survive the first step; this file carries no
+  ;; metadata, so the cycle also passes without it.)
+  (let [profile (th/create-profile* 1)
+        file    (th/create-file* 1 {:profile-id (:id profile)
+                                    :project-id (:default-project-id profile)
+                                    :is-shared false})
+        file-id (:id file)
+        f0      (bfc/get-file th/*system* file-id)
+        page-id (first (:pages (:data f0)))
+        before  (into {} (map (juxt :id identity))
+                      (th/db-query :file-data {:file-id file-id}))]
+    (t/is (pos? (count before)))
+    (let [result (th/run-task! :offload-file-data {:file-id file-id})]
+      (t/is (zero? (:skipped result)))
+      (t/is (pos? (:offloaded result))))
+    (update-file! :profile-id (:id profile)
+                  :file-id file-id
+                  :revn 0
+                  :changes (add-rect-change page-id (uuid/random)))
+    ;; The edit wrote hot rows back: some file_data is db-backed again.
+    (t/is (pos? (count (filter #(= "db" (:backend %))
+                               (th/db-query :file-data {:file-id file-id})))))
+    (th/db-delete! :file-change {:file-id file-id})
+    (th/db-delete! :file-data {:file-id file-id :type "snapshot"})
+    (t/is (true? (th/run-task! :file-gc {:file-id file-id})))
+    (let [live (:data (bfc/get-file th/*system* file-id :realize? true))]
+      (t/is (empty? (fdata/get-used-pointer-ids live))))
+    ;; Every referenced fragment is live.
+    (let [used (fdata/get-used-pointer-ids (:data (bfc/get-file th/*system* file-id)))
+          live (live-fragment-ids file-id)]
+      (t/is (pos? (count used)))
+      (t/is (every? live used)))))
