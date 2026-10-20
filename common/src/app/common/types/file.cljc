@@ -130,6 +130,20 @@
 (def check-file-data
   (sm/check-fn schema:data :hint "invalid file data"))
 
+(def decode-file-data
+  "Precompiled json decoder for file data. Compiling the decoder on
+  every call (via `sm/decode`) costs a schema walk per file; this one
+  is built once at load time. See `decode-file-metadata` below for
+  the same pattern."
+  (sm/decoder schema:data sm/json-transformer))
+
+(def decode-page-objects
+  "Precompiled json decoder for page `:objects` maps, used for the
+  explicit component-objects pass in `sanitize-file-data` (the
+  container schema keeps them opaque, so the top-level decode does
+  not descend into them)."
+  (sm/decoder ctp/schema:objects sm/json-transformer))
+
 (defn sanitize-file-data
   "Decode file data with the file schema and drop nil page entries,
   repairing the two corruption families seen in production: types
@@ -147,7 +161,7 @@
   (let [data (-> data
                  (update :pages (fn [pages] (into [] (remove nil?) pages)))
                  (update :pages-index dissoc nil))]
-    (-> (sm/decode schema:data data (sm/json-transformer))
+    (-> (decode-file-data data)
         ;; The container schema declares :objects opaque (:map), so
         ;; the top-level decode does not descend into component
         ;; shapes. Decode them explicitly with the page objects
@@ -156,10 +170,7 @@
                                      (d/update-vals components
                                                     (fn [component]
                                                       (d/update-when component :objects
-                                                                     (fn [objects]
-                                                                       (sm/decode ctp/schema:objects
-                                                                                  objects
-                                                                                  (sm/json-transformer)))))))))))
+                                                                     decode-page-objects))))))))
 
 (def check-file-media
   (sm/check-fn schema:media))
