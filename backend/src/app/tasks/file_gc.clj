@@ -244,43 +244,42 @@
   is returned untouched so the garbage collection still runs as
   before."
   [file libs]
-  (let [clean file]
-    (try
-      (loop [file clean
-             iteration 0]
-        (let [errors (not-empty (cfv/validate-file file libs))]
-          (cond
-            (empty? errors)
-            (do
-              (when (pos? iteration)
-                (l/trc :hint "file repaired"
-                       :file-id (str (:id file))
-                       :iterations iteration))
-              {:file file :repaired? (pos? iteration)})
+  (try
+    (loop [current file
+           iteration 0]
+      (let [errors (not-empty (cfv/validate-file current libs))]
+        (cond
+          (empty? errors)
+          (do
+            (when (pos? iteration)
+              (l/trc :hint "file repaired"
+                     :file-id (str (:id current))
+                     :iterations iteration))
+            {:file current :repaired? (pos? iteration)})
 
-            (>= iteration 10)
-            (do
-              (l/wrn :hint "file still invalid after repair, cleaning as is"
-                     :file-id (str (:id file))
-                     :errors (count errors))
-              {:file clean})
+          (>= iteration 10)
+          (do
+            (l/wrn :hint "file still invalid after repair, cleaning as is"
+                   :file-id (str (:id current))
+                   :errors (count errors))
+            {:file file})
 
-            :else
-            (do
-              (l/trc :hint "repairing file"
-                     :file-id (str (:id file))
-                     :iteration iteration
-                     :errors (count errors))
-              (let [changes (cfr/repair-file file libs errors)]
-                (recur (-> file
-                           (update :revn inc)
-                           (update :data cfc/process-changes changes))
-                       (inc iteration)))))))
-      (catch Throwable cause
-        (l/wrn :hint "error on repairing file, cleaning as is"
-               :file-id (str (:id clean))
-               :cause cause)
-        {:file clean}))))
+          :else
+          (do
+            (l/trc :hint "repairing file"
+                   :file-id (str (:id current))
+                   :iteration iteration
+                   :errors (count errors))
+            (let [changes (cfr/repair-file current libs errors)]
+              (recur (-> current
+                         (update :revn inc)
+                         (update :data cfc/process-changes changes))
+                     (inc iteration)))))))
+    (catch Throwable cause
+      (l/wrn :hint "error on repairing file, cleaning as is"
+             :file-id (str (:id file))
+             :cause cause)
+      {:file file})))
 
 (defn- read-file-with-explicit-migration
   "Fallback read for files whose migrating read throws: reads without
