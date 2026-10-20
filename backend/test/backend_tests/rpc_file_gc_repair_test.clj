@@ -300,8 +300,8 @@
         (update :data #(corrupt-with-unknown-type % page-id shape-id))
         (persist-file))
 
-    ;; Force the read-time migration check: neither the normal path
-    ;; nor the explicit-migration fallback can fix an unknown type.
+    ;; Force the read-time migration check: the single read path
+    ;; cannot fix an unknown type.
     (th/db-delete! :file-migration {:file-id file-id})
 
     (let [revn-before (:revn (th/db-get :file {:id file-id}))
@@ -325,17 +325,15 @@
                   "no half transaction was persisted")
             (t/is (some? repairing)
                   "the failure is reported as a Tx1 error")
-            ;; The retry failure chains the original read cause so Loki
-            ;; shows both with the default level, not just the second.
+            ;; The single read attempt chains its cause so Loki shows
+            ;; it with the default level.
             (let [cause (::l/cause repairing)
                   data (ex-data cause)]
               (t/is (= :tx1-read (:phase data))
-                    "the retry wrapper tags the Tx1 read phase")
+                    "the wrapper tags the Tx1 read phase")
               (t/is (= (str file-id) (:file-id data)))
-              (t/is (some? (:retry-cause data))
-                    "the retry failure is kept in ex-data")
               (t/is (some? (.getCause ^Throwable cause))
-                    "the original read cause is chained"))
+                    "the read cause is chained"))
             ;; Tx2 never runs, so no cleaning log is ever queued: check
             ;; the captured records directly instead of waiting out the
             ;; full deadline for something that will never arrive.

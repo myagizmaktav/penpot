@@ -32,8 +32,6 @@
    [app.worker :as wrk]
    [integrant.core :as ig]))
 
-(declare get-file)
-
 (def ^:private sql:mark-file-media-object-deleted
   "UPDATE file_media_object
       SET deleted_at = ?
@@ -222,19 +220,6 @@
     (cfv/validate-file-schema! file)
     file))
 
-(defn get-file
-  [cfg {:keys [file-id revn]}]
-  (let [file (bfc/get-file cfg file-id
-                           :realize? true
-                           :skip-locked? true
-                           :lock-for-update? true)]
-
-    ;; We should ensure that the scheduled file and the procesing file
-    ;; has not changed since schedule, for this reason we check the
-    ;; revn from props with the revn from retrieved file from database
-    (when (or (nil? revn) (= revn (:revn file)))
-      file)))
-
 ;; FIXME: we should skip files that does not match the revn on the
 ;; props and add proper schema for this task props
 
@@ -281,48 +266,29 @@
              :cause cause)
       {:file file})))
 
-(defn- read-file-with-explicit-migration
-  "Fallback read for files whose migrating read throws: reads without
-  migrating, sanitizes first so legacy migrations do not choke on
-  unconverted types, then migrates and persists explicitly, mirroring
-  what get-file does on the normal path."
+(defn- get-file
+  "Reads the file holding the row lock without migrating, sanitizes
+  first so legacy migrations do not choke on unconverted types, then
+  migrates and persists explicitly."
   [cfg {:keys [file-id] :as props}]
   (when-let [file (bfc/get-file cfg file-id
                                 :realize? true
                                 :skip-locked? true
                                 :lock-for-update? true
                                 :migrate? false)]
-    (let [libs (delay (bfc/get-resolved-file-libraries cfg file))
-          file (-> file
-                   (update :data ctf/sanitize-file-data)
-                   (fmg/migrate-file libs))]
-      (bfc/update-file! cfg file)
-      (when (or (nil? (:revn props)) (= (:revn props) (:revn file)))
-        file))))
-
-(defn- read-file
-  "Reads the file holding the row lock. When the read fails for any
-  reason, retries once without migrations so the fallback can
-  sanitize and migrate explicitly: legacy migrations may choke on
-  unconverted types that sanitize-first then fixes. If the retry
-  also fails, the original cause is chained so the handler log shows
-  both failures instead of only the second one."
-  [cfg {:keys [file-id] :as props}]
-  (try
-    (get-file cfg props)
-    (catch Throwable original
-      (l/trc :hint "retrying read with explicit migration"
-             :file-id (str file-id)
-             :cause original)
-      (try
-        (read-file-with-explicit-migration cfg props)
-        (catch Throwable retry-cause
-          (ex/raise :type :internal
-                    :hint "file-gc read failed after explicit migration retry"
-                    :file-id (str file-id)
-                    :phase :tx1-read
-                    :retry-cause retry-cause
-                    :cause original))))))
+    (let [libs  (delay (bfc/get-resolved-file-libraries cfg file))
+          clean (-> file
+                    (update :data ctf/sanitize-file-data)
+                    (fmg/migrate-file libs))]
+      ;; Persist only when sanitize or migration changed something: a
+      ;; clean file stays untouched, so preventive runs write nothing.
+      (when (not= file clean)
+        (bfc/update-file! cfg clean))
+      ;; We should ensure that the scheduled file and the procesing file
+      ;; has not changed since schedule, for this reason we check the
+      ;; revn from props with the revn from retrieved file from database
+      (when (or (nil? (:revn props)) (= (:revn props) (:revn clean)))
+        clean))))
 
 (defn- repair-and-persist
   "First transaction: read the file holding the row lock, run the
@@ -338,7 +304,14 @@
                 (let [cfg (-> cfg
                               (update ::sto/storage sto/configure conn)
                               (assoc ::timestamp (ct/now)))]
-                  (if-let [file (read-file cfg props)]
+                  (if-let [file (try
+                                  (get-file cfg props)
+                                  (catch Throwable cause
+                                    (ex/raise :type :internal
+                                              :hint "file-gc read failed"
+                                              :file-id (str (:file-id props))
+                                              :phase :tx1-read
+                                              :cause cause)))]
                     (try
                       ;; Libraries resolve lazily through the weak map;
                       ;; each one realizes on load with its own loader,
