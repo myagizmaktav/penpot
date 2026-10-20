@@ -22,6 +22,7 @@
    [app.db.sql :as sql]
    [app.features.fdata :as fdata]
    [app.http :as http]
+   [app.jobs :as-alias jobs]
    [app.loggers.audit :as-alias audit]
    [app.rpc :as-alias rpc]
    [app.rpc.commands.files :as files]
@@ -2327,14 +2328,30 @@
                               :id (:id library)})]
     (t/is (nil? (:error out)))
 
-    ;; The relations are removed at once, the absorption is done by the
-    ;; deletion task.
-    (t/is (empty? (th/db-query :file-library-rel {:library-file-id (:id library)})))
+    ;; The relations stay until the deletion task runs: the job
+    ;; captures the dependents, removes the relations and absorbs
+    ;; them there.
+    (t/is (not (empty? (th/db-query :file-library-rel {:library-file-id (:id library)}))))
     (t/is (= (:id library)
              (cfo/get-tokens-source (:data (bfc/get-file th/*system* (:id file))))))
 
     (th/run-pending-jobs)
+    (t/is (empty? (th/db-query :file-library-rel {:library-file-id (:id library)})))
     (check-tokens-absorbed prepared)))
+
+(t/deftest delete-shared-library-queues-job-without-file-ids
+  ;; The cascade captures the dependents itself: the RPC no longer
+  ;; snapshots them into the job params.
+  (let [profile (th/create-profile* 1)
+        {:keys [library]} (prepare-tokens-library profile)
+        submitted (atom nil)]
+    (with-redefs [jobs/submit (fn [_ params] (reset! submitted params) (uuid/next))]
+      (let [out (th/command! {::th/type :delete-file
+                              ::rpc/profile-id (:id profile)
+                              :id (:id library)})]
+        (t/is (nil? (:error out)))))
+    (t/is (= :delete-object (::jobs/name @submitted)))
+    (t/is (not (contains? (::jobs/params @submitted) :file-ids)))))
 
 (t/deftest unpublish-shared-library-absorbs-its-tokens-lib
   (let [profile (th/create-profile* 1)

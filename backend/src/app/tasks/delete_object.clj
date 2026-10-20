@@ -63,7 +63,7 @@
               {::db/return-keys false}))
 
 (defmethod delete-object :file
-  [{:keys [::db/conn] :as cfg} {:keys [id deleted-at file-ids]}]
+  [{:keys [::db/conn] :as cfg} {:keys [id deleted-at]}]
   (when-let [file (db/get* conn :file {:id id}
                            {::db/remove-deleted false
                             ::sql/columns [:id :is-shared]})]
@@ -81,7 +81,11 @@
                (not *team-deletion*))
       ;; NOTE: we don't prevent file deletion on absorb operation failure
       (try
-        (db/tx-run! cfg files/absorb-library id :file-ids file-ids)
+        ;; Capture the dependents before removing the relations, then
+        ;; absorb them: the relations must still exist at this point.
+        (let [dependents (files/get-referenced-files conn id)]
+          (db/delete! conn :file-library-rel {:library-file-id id})
+          (db/tx-run! cfg files/absorb-library id :file-ids dependents))
         (catch Throwable cause
           (l/warn :hint "error on absorbing library"
                   :file-id id
@@ -190,8 +194,7 @@
    [:object [:enum :snapshot :team :project :profile :file]]
    [:deleted-at ::ct/inst]
    [:id ::sm/uuid]
-   [:file-id {:optional true} ::sm/uuid]
-   [:file-ids {:optional true} [:vector ::sm/uuid]]])
+   [:file-id {:optional true} ::sm/uuid]])
 
 (defn execute-delete-object
   "Plain job handler: run the delete-object multimethod on the provided
