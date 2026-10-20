@@ -898,7 +898,12 @@
   (let [library-ids (->> (get-file-libraries conn (:id file))
                          (map :id)
                          (cons (:id file)))
-        load-fn     #(get-file cfg % :migrate? false)]
+        ;; Realize pointers on load with each library's own loader
+        ;; (pointers are file-local): values need no ambient *load-fn*
+        ;; binding to be dereferenced, while the objects-map stays
+        ;; lazy as before and the map itself stays lazy and weak.
+        load-fn     #(->> (get-file cfg % :migrate? false)
+                          (fdata/realize-pointers cfg))]
     (weak/loadable-weak-value-map library-ids load-fn {id file})))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

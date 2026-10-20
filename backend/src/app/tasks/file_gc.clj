@@ -29,7 +29,6 @@
    [app.features.fdata :as feat.fdata]
    [app.features.file-snapshots :as fsnap]
    [app.storage :as sto]
-   [app.util.pointer-map :as pmap]
    [app.worker :as wrk]
    [integrant.core :as ig]))
 
@@ -145,8 +144,8 @@
   deleted to collect."
   [cfg file deleted-components]
   (if (seq deleted-components)
-    (let [file-id (:id file)
-          file-xform (mapcat (partial get-used-components deleted-components file-id))
+    (let [file-id       (:id file)
+          file-xform    (mapcat (partial get-used-components deleted-components file-id))
           library-xform (comp (map :id)
                               (map #(bfc/get-file cfg % :realize? true :read-only? true))
                               file-xform)]
@@ -238,19 +237,6 @@
 
 ;; FIXME: we should skip files that does not match the revn on the
 ;; props and add proper schema for this task props
-
-(defn- realize-libraries
-  "Realize every library up front. Validation dereferences library
-  data on copy checks, and pointers are file-local, hence each library
-  is realized with its own loader bound. This mirrors what
-  clean-deleted-components already does per library file."
-  [cfg libraries]
-  (into {}
-        (map (fn [[id lib]]
-               [id (binding [pmap/*load-fn* (partial feat.fdata/load-pointer cfg id)
-                             pmap/*tracked* (pmap/create-tracked)]
-                     (feat.fdata/realize cfg lib))]))
-        libraries))
 
 (defn- repair-loop
   "Runs the semantic repair loop over an in-memory file. Repair is
@@ -355,8 +341,10 @@
                               (assoc ::timestamp (ct/now)))]
                   (if-let [file (read-file cfg props)]
                     (try
-                      (let [libs (->> (bfc/get-resolved-file-libraries cfg file)
-                                      (realize-libraries cfg))
+                      ;; Libraries resolve lazily through the weak map;
+                      ;; each one realizes on load with its own loader,
+                      ;; so validation needs no ambient *load-fn*.
+                      (let [libs (bfc/get-resolved-file-libraries cfg file)
                             {:keys [file repaired?]} (repair-loop (-> file bfl/clean-file) libs)]
                         (cfv/validate-file-schema! file)
                         (when repaired?
