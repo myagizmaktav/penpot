@@ -312,7 +312,7 @@
 
       (when snapshot
         (fsnap/create! cfg snapshot
-                       {:objects-map? (boolean (::objects-map? snapshot))
+                       {:objects-map (boolean (::objects-map snapshot))
                         :label (str "internal/snapshot/" revn)
                         :created-by "system"
                         :deleted-at (ct/plus timestamp (ldel/get-deletion-delay team))
@@ -400,7 +400,7 @@
   "Attaches to `file` the snapshot of its state before the changes. The
   snapshot keeps `data`, the data as stored, except for a migrated file
   (the migrated data) or one with pointers (the data with its pointers
-  realized). Stored data comes with `::objects-map?`."
+  realized). Stored data comes with `::objects-map`."
   [cfg migrated? data file]
   (let [snapshot (cond
                    migrated?
@@ -412,7 +412,7 @@
                    :else
                    (assoc file
                           :data data
-                          ::objects-map? (boolean (fdata/has-objects-map? (:data file)))))]
+                          ::objects-map (boolean (fdata/has-objects-map? (:data file)))))]
     (assoc file ::snapshot snapshot)))
 
 (defn- update-file-data!

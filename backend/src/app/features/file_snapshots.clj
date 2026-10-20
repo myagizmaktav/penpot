@@ -206,7 +206,7 @@
    [:session-id {:optional true} ::sm/uuid]
    [:modified-at {:optional true} ::ct/inst]
    [:deleted-at {:optional true} ::ct/inst]
-   [:objects-map? {:optional true} :boolean]])
+   [:objects-map {:optional true} :boolean]])
 
 (def ^:private check-create-params
   (sm/check-fn schema:create-params))
@@ -220,11 +220,11 @@
 
 (defn create!
   "Creates a snapshot of `file`. Its data is decoded, or encoded with
-  `:objects-map?` telling whether it holds objects-maps. Data with
+  `:objects-map` telling whether it holds objects-maps. Data with
   objects-maps is compacted by the `compact-file-snapshot` task, or here
   on the legacy-db backend."
   [cfg file & {:as params}]
-  (let [{:keys [label created-by deleted-at profile-id session-id objects-map?]}
+  (let [{:keys [label created-by deleted-at profile-id session-id objects-map]}
         (check-create-params params)
 
         file
@@ -235,7 +235,7 @@
 
         compact?
         (if (bytes? data)
-          (boolean objects-map?)
+          (boolean objects-map)
           (boolean (fdata/has-objects-map? data)))
 
         compact-later?
