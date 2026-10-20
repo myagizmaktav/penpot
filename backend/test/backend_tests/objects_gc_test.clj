@@ -153,8 +153,10 @@
         (th/reset-mock! audit-mock)
         (th/run-task! :objects-gc {:skip-delay true})
         (t/is (nil? (th/db-get :team {:id (:id team)} {::db/remove-deleted false})))
-        (let [events (filter #(contains? (:props %) :team-ids)
+        (let [events (filter #(= #{:team-ids} (set (keys (:props %))))
                              (events-named audit-mock "hard-delete-objects"))]
+          ;; Only the team chunk carries :team-ids alone; project and
+          ;; file chunks add their own entity key next to the flat one.
           (t/is (= 1 (count events)))
           (let [event (first events)]
             (t/is (= "command" (:type event)))

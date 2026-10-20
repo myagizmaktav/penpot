@@ -466,17 +466,6 @@
       (complete-batch cfg consumer-admin-console rows)
       admin-console-res)))
 
-(def ^:private sql:team-ids-by-files
-  "SELECT p.team_id AS team_id
-     FROM file AS f
-     JOIN project AS p ON (p.id = f.project_id)
-    WHERE f.id = ANY(?::uuid[])")
-
-(def ^:private sql:team-ids-by-projects
-  "SELECT team_id
-     FROM project
-    WHERE id = ANY(?::uuid[])")
-
 (def ^:private sql:mark-storage-usage-dirty
   "INSERT INTO team_storage_usage AS tsu (team_id, dirty_at)
    SELECT id, now() FROM unnest(?::uuid[]) AS u(id)
@@ -485,38 +474,19 @@
     WHERE tsu.dirty_at IS NULL")
 
 (defn- collect-storage-usage-team-ids
-  "Team ids whose media storage may have changed in this chunk. Reads
-  :team-id straight from props when present, otherwise resolves the
-  file and project ids (cascade events carry them nested) with two
-  batched lookups. Unresolvable rows are skipped with a warning: the
+  "Team ids whose media storage may have changed in this chunk, read
+  straight from props: producers key their events by team so the drain
+  never joins production tables. Unresolvable rows are skipped: the
   next event marks the team again, and the recompute job sweeps the
   teams that were never computed."
-  [{:keys [::db/conn]} events]
-  (let [maps     (filter some? (mapcat (fn [{:keys [props]}] [props (:cascade props)]) events))
-        direct   (into #{} (comp (mapcat (fn [m] (concat (some-> (:team-id m) vector)
-                                                         (:team-ids m))))
-                                 (keep uuid/coerce))
-                       maps)
-        file-ids (into #{} (comp (mapcat (fn [m] (concat (some-> (:file-id m) vector)
-                                                         (:file-ids m)
-                                                         (:files m))))
-                                 (keep uuid/coerce))
-                       maps)
-        proj-ids (into #{} (comp (mapcat (fn [m] (concat (some-> (:project-id m) vector)
-                                                         (:project-ids m))))
-                                 (keep uuid/coerce))
-                       maps)
-        by-file  (if (seq file-ids)
-                   (into #{} (map :team-id)
-                         (db/exec! conn [sql:team-ids-by-files
-                                         (db/create-array conn "uuid" file-ids)]))
-                   #{})
-        by-proj  (if (seq proj-ids)
-                   (into #{} (map :team-id)
-                         (db/exec! conn [sql:team-ids-by-projects
-                                         (db/create-array conn "uuid" proj-ids)]))
-                   #{})]
-    (into direct (concat by-file by-proj))))
+  [events]
+  (into #{}
+        (comp (mapcat (fn [{:keys [props]}]
+                        (concat (some-> (:team-id props) vector)
+                                (:team-ids props)
+                                (:team-ids (:cascade props)))))
+              (keep uuid/coerce))
+        events))
 
 (defn- mark-storage-usage-dirty
   [conn team-ids]
@@ -538,7 +508,7 @@
     (let [events   (mapv row->event (mapv decode-row rows))
           relevant (filterv #(contains? storage-usage-event-names (:name %)) events)
           skipped  (- (count events) (count relevant))
-          teams    (collect-storage-usage-team-ids cfg relevant)
+          teams    (collect-storage-usage-team-ids relevant)
           _        (mark-storage-usage-dirty (::db/conn cfg) teams)]
       (l/trc :hint "consumer events chunk"
              :consumer "storage-usage"

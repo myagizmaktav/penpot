@@ -422,15 +422,39 @@
 
     coerced))
 
-(def ^:private sql:team-id-by-project
-  "SELECT id FROM team
-    WHERE id = (SELECT team_id FROM project WHERE id = ?)")
+(def ^:private sql:team-ids-by-projects
+  "SELECT team_id
+     FROM project
+    WHERE id = ANY(?::uuid[])")
 
-(def ^:private sql:team-id-by-file
-  "SELECT t.id FROM team AS t
-     JOIN project AS p ON (p.team_id = t.id)
-     JOIN file AS f ON (f.project_id = p.id)
-    WHERE f.id = ?")
+(def ^:private sql:team-ids-by-files
+  "SELECT p.team_id AS team_id
+     FROM file AS f
+     JOIN project AS p ON (p.id = f.project_id)
+    WHERE f.id = ANY(?::uuid[])")
+
+(defn get-team-ids
+  "Resolve a mixed bag of team, project and file ids to team ids with
+  two batched lookups. Producers of cascade-style events call it so
+  consumers never join production tables. Takes any connectable: inside
+  a transaction it reuses the caller connection."
+  [cfg {:keys [team-ids project-ids file-ids]}]
+  (db/run! cfg
+           (fn [{:keys [::db/conn]}]
+             (let [direct  (into #{} (keep uuid/coerce) team-ids)
+                   by-proj (if (seq project-ids)
+                             (into #{}
+                                   (map :team-id)
+                                   (db/exec! conn [sql:team-ids-by-projects
+                                                   (db/create-array conn "uuid" project-ids)]))
+                             #{})
+                   by-file (if (seq file-ids)
+                             (into #{}
+                                   (map :team-id)
+                                   (db/exec! conn [sql:team-ids-by-files
+                                                   (db/create-array conn "uuid" file-ids)]))
+                             #{})]
+               (into direct (concat by-proj by-file))))))
 
 (def ^:private read-event-names
   "Read commands excluded from team-id resolution on top of the `get-*`
@@ -457,9 +481,9 @@
     (let [project-id (:project-id props)
           file-id    (:file-id props)
           team-id    (or (when (some? project-id)
-                           (:id (db/exec-one! cfg [sql:team-id-by-project project-id])))
+                           (first (get-team-ids cfg {:project-ids [project-id]})))
                          (when (some? file-id)
-                           (:id (db/exec-one! cfg [sql:team-id-by-file file-id]))))]
+                           (first (get-team-ids cfg {:file-ids [file-id]}))))]
       (cond-> props
         (some? team-id) (assoc :team-id team-id)))))
 

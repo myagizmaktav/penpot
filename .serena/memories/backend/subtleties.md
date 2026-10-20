@@ -80,7 +80,7 @@
 
 ## Storage and media
 
-- The `media-storage-bytes-per-team` quota check on `upload-file-media-object` is TEMPORARILY DISABLED (2026-10-19, kept commented in `app.rpc.commands.media` with its `sql:get-team-id-for-file` lookup still active for the audit props): the quote performs a full `SUM` over `storage_object` per upload and was too slow in production. The `upload-sessions-per-profile` quota is unaffected and stays active. Re-enable only with a cheaper approximation.
+- The `media-storage-bytes-per-team` quota check on `upload-file-media-object` reads the cached `team_storage_usage` counter (fail open + mark dirty when the row is missing) instead of scanning `storage_object` per upload; the live `SUM` only runs when the `:storage-usage` + `:audit-log` flags are off, and in the background recompute job. A third audit-log consumer (id 3, selective pendings) marks dirty teams and `:recompute-team-storage` refills them bounded per run. `file-gc` emits `file-gc` so trims mark the team dirty; `delete-object-with-cascade` and `hard-delete-objects` carry flat `:team-ids` so the drain never joins production tables. The `upload-sessions-per-profile` quota is unaffected.
 - Storage abstraction, backend configuration, logical buckets, object lifecycle, deduplication, access rules, and garbage collection: `mem:backend/storage`.
 - SVG validation strips DOCTYPE and uses secure SAX parsing. Basic SVG info falls back to 100x100 dimensions when width/height/viewBox are missing.
 - Raster metadata is shell-derived with ImageMagick `identify`, verifies detected MIME against the supplied MIME, and swaps dimensions for EXIF orientations 6/8.

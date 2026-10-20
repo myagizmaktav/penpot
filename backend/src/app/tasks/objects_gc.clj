@@ -42,14 +42,25 @@
   chunk carries only its own entity key (`:team-ids`, `:project-ids`
   or `:file-ids`); a single event spanning sections could never share
   their transactions. Runs inside the caller transaction, next to the
-  deletes: if the purge aborts, the event aborts with it."
+  deletes: if the purge aborts, the event aborts with it. The flat
+  `:team-ids` let team-keyed consumers skip joining production tables."
   [cfg ids-key ids]
   (when (contains? cf/flags :audit-log)
-    (audit/submit cfg
-                  {:name "hard-delete-objects"
-                   :type "command"
-                   :props {ids-key (vec ids)}
-                   :context {:triggered-by "objects-gc"}})))
+    (let [team-ids (case ids-key
+                     :team-ids (vec ids)
+                     :project-ids (vec (audit/get-team-ids cfg {:project-ids ids}))
+                     :file-ids (vec (audit/get-team-ids cfg {:file-ids ids}))
+                     [])]
+      (audit/submit cfg
+                    {:name "hard-delete-objects"
+                     :type "command"
+                     ;; The entity key stays first; :team-ids rides next to
+                     ;; it except when it IS the entity key (team chunks
+                     ;; keep their exact historical shape).
+                     :props (cond-> {ids-key (vec ids)}
+                              (not= ids-key :team-ids)
+                              (assoc :team-ids team-ids))
+                     :context {:triggered-by "objects-gc"}}))))
 
 (def ^:private sql:get-upload-sessions
   "SELECT us.id

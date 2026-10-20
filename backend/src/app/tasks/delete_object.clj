@@ -205,15 +205,23 @@
                     (delete-object cfg params)
                     (let [{:keys [teams projects files]} @*cascade*]
                       (when (or (seq teams) (seq projects) (seq files))
-                        (audit/submit cfg {:name "delete-object-with-cascade"
-                                           :type "action"
-                                           :props {:object (:object params)
-                                                   :id (:id params)
-                                                   :deleted-at (:deleted-at params)
-                                                   :cascade {:team-ids teams
-                                                             :project-ids projects
-                                                             :file-ids files}}
-                                           :context {:triggered-by "delete-object"}}))))))))
+                        ;; Flat team ids for consumers that key on them
+                        ;; (the storage-usage drain), so they never join
+                        ;; production tables.
+                        (let [team-ids (audit/get-team-ids cfg
+                                                           {:team-ids teams
+                                                            :project-ids projects
+                                                            :file-ids files})]
+                          (audit/submit cfg {:name "delete-object-with-cascade"
+                                             :type "action"
+                                             :props {:object (:object params)
+                                                     :id (:id params)
+                                                     :deleted-at (:deleted-at params)
+                                                     :team-ids (vec team-ids)
+                                                     :cascade {:team-ids teams
+                                                               :project-ids projects
+                                                               :file-ids files}}
+                                             :context {:triggered-by "delete-object"}})))))))))
 
 (defmethod ig/assert-key ::job-def
   [_ params]
