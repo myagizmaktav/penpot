@@ -360,13 +360,24 @@
                       nil))))))
 
 
+(def ^:private sql:lock-file-revn
+  "SELECT f.revn FROM file AS f WHERE f.id = ? AND f.deleted_at IS NULL FOR UPDATE OF f SKIP LOCKED")
+
+(defn- lock-file-revn
+  "Take the row lock and return the current revn, or nil when the row
+  is locked elsewhere or gone."
+  [conn id]
+  (:revn (db/exec-one! conn [sql:lock-file-revn id])))
+
 (defn- gc-file
-  "Second transaction: re-read the file fresh, check nobody modified
-  it since the read phase, and run the garbage collection. Takes the
-  set of component ids still in use by library users and the deleted
-  components, both computed beforehand outside any write transaction."
-  [cfg used-remote deleted-components {:keys [file-id revn]}]
-  (if-let [file (get-file cfg {:file-id file-id :revn revn})]
+  "Second transaction: take the row lock, check nobody modified the
+  file since the first transaction, and run the garbage collection on
+  its snapshot instead of re-reading it. Takes the file returned by
+  the first transaction, the set of component ids still in use by
+  library users and the deleted components, both computed beforehand
+  outside any write transaction."
+  [{:keys [::db/conn] :as cfg} used-remote deleted-components {:keys [id revn] :as file}]
+  (if (= revn (lock-file-revn conn id))
     (let [file (->> file
                     bfl/clean-file
                     (clean-media cfg used-remote deleted-components)
@@ -376,25 +387,25 @@
       true)
 
     (do
-      (l/dbg :hint "skip cleaning, criteria does not match" :file-id (str file-id))
+      (l/dbg :hint "skip cleaning, file changed since repair" :file-id (str id))
       false)))
 
 (defn- gc-in-tx
-  "Second transaction: run the garbage collection. Everything
-  expensive (loading the files that use this one as a library) happens
-  outside any write transaction; the write transaction itself only
-  re-reads with the row lock, checks nobody modified the file in the
-  meantime, applies the marks and commits. Returns true when the file
-  was cleaned."
-  [cfg {:keys [id revn data] :as file}]
+  "Second transaction: run the garbage collection on the snapshot
+  returned by the first transaction. Everything expensive (loading the
+  files that use this one as a library) happens outside any write
+  transaction; the write transaction itself only takes the row lock,
+  checks nobody modified the file in the meantime, applies the marks
+  and commits. Returns true when the file was cleaned."
+  [cfg {:keys [data] :as file}]
   (let [deleted-components (ctkl/deleted-components-seq data)
-        used-remote (find-used-components cfg file deleted-components)]
+        used-remote        (find-used-components cfg file deleted-components)]
     (db/tx-run! cfg
                 (fn [{:keys [::db/conn] :as cfg}]
                   (let [cfg (-> cfg
                                 (update ::sto/storage sto/configure conn)
                                 (assoc ::timestamp (ct/now)))]
-                    (gc-file cfg used-remote deleted-components {:file-id id :revn revn}))))))
+                    (gc-file cfg used-remote deleted-components file))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; HANDLER

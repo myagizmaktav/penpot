@@ -12,6 +12,7 @@
    [app.common.features :as cfeat]
    [app.common.files.validate :as cfv]
    [app.common.logging :as l]
+   [app.common.time :as ct]
    [app.common.types.shape :as cts]
    [app.common.uuid :as uuid]
    [app.db :as db]
@@ -383,6 +384,26 @@
                   "Tx2 wrote nothing")
             (t/is (> revn-after-bump revn-after-tx1)
                   "the concurrent bump is still there")))))))
+
+(t/deftest file-gc-tx2-skips-when-file-deleted
+  ;; White-box like the stale-revn test: delete the file after Tx1 and
+  ;; call gc-in-tx directly with the Tx1 snapshot. The light row lock
+  ;; sees the deleted row and Tx2 skips without writing.
+  (let [profile (th/create-profile* 1)
+        file    (th/create-file* 1 {:profile-id (:id profile)
+                                    :project-id (:default-project-id profile)
+                                    :is-shared false})
+        file-id (setup-file-with-rect profile file)]
+    (let [repaired (#'file-gc/repair-and-persist th/*system* {:file-id file-id})]
+      (t/is (some? repaired) "Tx1 reads and returns the file")
+      (th/db-update! :file {:deleted-at (ct/now)} {:id file-id})
+      (let [result (#'file-gc/gc-in-tx th/*system* repaired)
+            row    (th/db-get :file {:id file-id} {::db/remove-deleted false})]
+        (t/testing "Tx2 skips a file deleted after Tx1 without writing"
+          (t/is (false? result))
+          (t/is (some? (:deleted-at row)) "still deleted")
+          (t/is (false? (:has-media-trimmed row))
+                "the file is not marked as trimmed"))))))
 
 (t/deftest file-gc-tx1-repair-survives-tx2-failure
   ;; White-box: Tx1 commits on its own; a later Tx2 failure must not roll
