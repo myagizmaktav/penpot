@@ -23,6 +23,7 @@
    [app.main.data.changes :as dch]
    [app.main.data.event :as ev]
    [app.main.data.persistence :as dps]
+   [app.main.data.persistence.commits :as pcm]
    [app.main.data.render-wasm :as drw]
    [app.main.data.workspace :as dw]
    [app.main.data.workspace.undo :as dwu]
@@ -67,13 +68,13 @@
                       :error {:cause-type cause-type :commit-id first-id}
                       :queue (into #queue [] [first-id next-id other-id])
                       :index {first-id {:file-id file-id :file-vern 0
-                                        :redo-changes [{:type :add-obj :id shape-id :obj shape
-                                                        :page-id page-id :parent-id uuid/zero
-                                                        :frame-id uuid/zero}]}
+                                        :commits [{:redo-changes [{:type :add-obj :id shape-id :obj shape
+                                                                   :page-id page-id :parent-id uuid/zero
+                                                                   :frame-id uuid/zero}]}]}
                               next-id {:file-id file-id :file-vern 0
-                                       :redo-changes [(rename "Retained rectangle")]}
+                                       :commits [{:redo-changes [(rename "Retained rectangle")]}]}
                               other-id {:file-id (uuid/next) :file-vern 0
-                                        :redo-changes [(rename "Another file")]}}}
+                                        :commits [{:redo-changes [(rename "Another file")]}]}}}
             state    {:persistence pstate}
             loaded   (ptk/update (#'dw/bundle-fetched {:file file :file-id file-id :thumbnails {}})
                                  state)
@@ -84,6 +85,33 @@
                 "queued edits apply in order and exclude other files"))
         (t/is (identical? pstate (:persistence loaded))
               "restoring the editor must preserve the save queue")))))
+
+;; Scenario: a file loads again while an edit of it waits in the buffer.
+;; Proves: buffered edits apply too, after the queued ones, and those of
+;; other files do not.
+(t/deftest reopening-restores-the-buffered-edits-after-the-queued-ones
+  (let [file-id   (uuid/next)
+        page-id   (uuid/next)
+        commit-id (uuid/next)
+        rename    (fn [name]
+                    {:type :mod-obj :id uuid/zero :page-id page-id
+                     :operations [{:type :set :attr :name :val name}]})
+        file      {:id file-id
+                   :vern 0
+                   :data {:pages [page-id]
+                          :pages-index {page-id {:id page-id :name "Page"
+                                                 :objects {uuid/zero
+                                                           (cts/setup-shape {:id uuid/zero :type :frame})}}}}}
+        pstate    {:status :saving
+                   :queue (into #queue [] [commit-id])
+                   :index {commit-id {:file-id file-id :file-vern 0
+                                      :commits [{:redo-changes [(rename "Queued")]}]}}
+                   :buffer [{:file-id file-id :file-vern 0 :redo-changes [(rename "Buffered")]}
+                            {:file-id (uuid/next) :file-vern 0 :redo-changes [(rename "Another file")]}]}
+        loaded    (ptk/update (#'dw/bundle-fetched {:file file :file-id file-id :thumbnails {}})
+                              {:persistence pstate})]
+    (t/is (= "Buffered"
+             (get-in loaded [:files file-id :data :pages-index page-id :objects uuid/zero :name])))))
 
 ;; Scenario: a queued edit no longer applies to the data the server sent, so
 ;; replaying it throws. Proves: the file still opens, as the server sent it,
@@ -100,8 +128,8 @@
         pstate    {:status :saving
                    :queue (into #queue [] [commit-id])
                    :index {commit-id {:file-id file-id :file-vern 0
-                                      :redo-changes [{:type :mod-obj :id uuid/zero :page-id page-id
-                                                      :operations [{:type :no-longer-supported}]}]}}}
+                                      :commits [{:redo-changes [{:type :mod-obj :id uuid/zero :page-id page-id
+                                                                 :operations [{:type :no-longer-supported}]}]}]}}}
         loaded    (ptk/update (#'dw/bundle-fetched {:file file :file-id file-id :thumbnails {}})
                               {:persistence pstate})]
     (t/is (identical? data (get-in loaded [:files file-id :data])))
@@ -772,7 +800,7 @@
   (await
    (with-persistence
      (^:async fn [{:keys [file-id response requests store]}]
-       (let [commit (assoc @(local-commit file-id) :changes [])
+       (let [commit (pcm/queue-entry [@(local-commit file-id)])
              id     (:id commit)]
          (ptk/emit! store
                     #(assoc % :persistence {:queue (conj #queue [] id)
@@ -891,7 +919,7 @@
   (await
    (with-persistence
      (^:async fn [{:keys [file-id response requests store]}]
-       (let [commit (assoc @(local-commit file-id) ::dps/request-id (uuid/next))
+       (let [commit (assoc (pcm/queue-entry [@(local-commit file-id)]) ::dps/request-id (uuid/next))
              id     (:id commit)]
          (ptk/emit! store
                     #(assoc % :persistence {:queue (conj #queue [] id)
@@ -1537,6 +1565,63 @@
             (rx/push! response {:revn 2})
             (await (async/wait-for #(= :saved (get-in @store [:persistence :status]))
                                    "the queue drains")))))))))
+
+;; Scenario: as above, but the library is no longer loaded when this file's
+;; save comes back. Proves: the undo of the library's saved commit is still
+;; sent, without touching local data the library no longer has.
+(t/deftest ^:async a-rejection-queues-the-undo-of-a-saved-commit-of-a-file-not-loaded
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id response requests store]}]
+       (await
+        (mock/with-mocks*
+          {mw/ask! (mock/stub (fn [_] (rx/empty)))}
+          (let [lib-id    (uuid/next)
+                page-id   (uuid/next)
+                shape-id  (uuid/next)
+                lshape-id (uuid/next)
+                group     (uuid/next)
+                linked    (grouped (rename-commit lib-id page-id lshape-id "X" "Y") group)
+                commit    (grouped (rename-commit file-id page-id shape-id "A" "B") group)]
+            (ptk/emit! store (with-library file-id lib-id page-id shape-id "B" lshape-id "Y"))
+            (ptk/emit! store linked commit ::dps/force-persist)
+            (await (async/wait-for #(= 1 (count @requests)) "the library's save is sent first"))
+            (rx/push! response {:revn 1})
+            (await (async/wait-for #(= 2 (count @requests)) "this file's save is sent"))
+            (ptk/emit! store #(update % :files dissoc lib-id))
+            (rx/push! response (rejected-second commit))
+            (await (async/wait-for #(= 3 (count @requests)) "the undo is queued and sent"))
+            (t/is (= lib-id (get-in (nth @requests 2) [1 :id])))
+            (t/is (= [[(rename page-id lshape-id "X")]] (sent-changes requests 2)))
+            (t/is (empty? (get-in @store [:persistence :buffer])))
+            (t/is (nil? (get-in @store [:files lib-id])) "no local data is made up")
+            (t/is (= "A" (shape-name store file-id page-id shape-id)))
+            (rx/push! response {:revn 2})
+            (await (async/wait-for #(= :saved (get-in @store [:persistence :status]))
+                                   "the queue drains")))))))))
+
+;; Scenario: a library edit waits to be saved when a peer's change to this
+;; file arrives, and both files have a shape with the same id. Proves: a
+;; remote commit goes under the pending commits of its own file only.
+(t/deftest ^:async a-remote-commit-ignores-the-pending-commits-of-other-files
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id store]}]
+       (await
+        (mock/with-mocks*
+          {mw/ask! (mock/stub (fn [_] (rx/empty)))}
+          (let [lib-id   (uuid/next)
+                page-id  (uuid/next)
+                shape-id (uuid/next)]
+            (ptk/emit! store (with-library file-id lib-id page-id shape-id "A" shape-id "Y"))
+            (ptk/emit! store (rename-commit lib-id page-id shape-id "X" "Y"))
+            (await (async/wait-for #(seq (get-in @store [:persistence :buffer]))
+                                   "the library edit is buffered"))
+            (ptk/emit! store (remote-commit file-id 1 [(set-attr page-id shape-id :opacity 0.3)]))
+            (await (async/settle))
+            (t/is (= 0.3 (shape-attr store file-id page-id shape-id :opacity)))
+            (t/is (= "A" (shape-name store file-id page-id shape-id))
+                  "the library edit is not replayed on this file"))))))))
 
 ;; Scenario: one action makes two commits in this file and the save keeps
 ;; the first and rejects the second. Proves: the kept commit of the action

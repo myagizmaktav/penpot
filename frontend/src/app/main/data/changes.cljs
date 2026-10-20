@@ -16,6 +16,7 @@
    [app.common.uuid :as uuid]
    [app.main.data.event :as ev]
    [app.main.data.helpers :as dsh]
+   [app.main.data.persistence.commits :as pcm]
    [app.main.data.workspace :as-alias dw]
    [app.main.features :as features]
    [app.main.worker :as mw]
@@ -68,14 +69,6 @@
                                    :cause cause)
                          (rx/empty)))
              (rx/ignore))))))
-
-(defn- get-pending-commits
-  "Unsaved local commits, oldest first: queued, then buffered."
-  [{:keys [persistence]}]
-  (-> []
-      (into (map (d/getf (:index persistence))) (:queue persistence))
-      (into (:buffer persistence))
-      (not-empty)))
 
 (def ^:private xf:map-page-id
   (map :page-id))
@@ -201,7 +194,7 @@
       ptk/WatchEvent
       (watch [_ state _]
         (let [pending (when-not local?
-                        (get-pending-commits state))]
+                        (not-empty (pcm/pending-commits (:persistence state) file-id)))]
           (rx/concat
            (rx/of (apply-changes-localy commit pending))
            (if pending

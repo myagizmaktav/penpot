@@ -130,3 +130,31 @@
   (let [record @#'files-update/record-validation-timing]
     (t/is (nil? (record {} :resolve-libs-ms "resolve-libs" 12)))
     (t/is (nil? (record {::mtx/metrics nil} :resolve-libs-ms "resolve-libs" 12)))))
+
+(t/deftest retries-record-one-sample-per-step-and-one-retry-sample
+  (let [metrics (ig/init-key :app.metrics/metrics {:default main/default-metrics})
+        cfg     (test-cfg metrics)
+        commit  (fn [name]
+                  {:commit-id (uuid/next)
+                   :changes [{:type :mod-page :id (uuid/next) :name name}]})
+        commits [(commit "a") (commit "b") (commit "bad") (commit "c")]]
+    (binding [cf/flags all-flags
+              pmap/*tracked* (pmap/create-tracked)]
+      (with-redefs [bfc/get-resolved-file-libraries (fn [_ _] {})
+                    val/validate-file-affected! (fn [_ _ changes]
+                                                  (when (some #(= "bad" (:name %)) changes)
+                                                    (throw (ex-info "bad file" {:type :validation
+                                                                                :code :referential-integrity}))))
+                    val/validate-file-schema-affected! (fn [_ _] nil)]
+        (let [file    (@#'files-update/process-changes-and-validate
+                       cfg (test-file) (into [] (mapcat :changes) commits) commits nil)
+              timings @(::files-update/validation-timings cfg)]
+          (t/is (= (mapv :commit-id (subvec commits 2))
+                   (:commit-ids (::files-update/rejected file))))
+          (t/is (number? (:retry-ms timings)))
+          ;; The first pass fails at validate-affected, before validate-schema
+          (doseq [step ["process-changes" "soft-validate-affected" "soft-validate-schema"
+                        "validate-affected" "retry"]]
+            (t/is (= 1.0 (bucket-value metrics "penpot_rpc_update_file_validation_timing"
+                                       ["step"] [step] "60000.0"))
+                  (str "expected one sample for step " step))))))))
