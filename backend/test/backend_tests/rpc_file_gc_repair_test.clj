@@ -353,7 +353,7 @@
 
 (t/deftest file-gc-tx2-aborts-when-file-changed
   ;; White-box: the handler always runs Tx1 and Tx2 back to back, so the
-  ;; revn-abort is only isolable by calling gc-in-tx directly.
+  ;; revn-abort is only isolable by calling clean-file-in-tx directly.
   (let [profile (th/create-profile* 1)
         file    (th/create-file* 1 {:profile-id (:id profile)
                                     :project-id (:default-project-id profile)
@@ -375,7 +375,7 @@
          :revn revn-after-tx1
          :changes [{:type :mod-page :id page-id :name "bumped"}])
         (let [revn-after-bump (:revn (th/db-get :file {:id file-id}))
-              result          (#'file-gc/gc-in-tx th/*system* repaired)]
+              result          (#'file-gc/clean-file-in-tx th/*system* repaired)]
           (t/testing "Tx2 aborts on stale revn without writing"
             (t/is (false? result))
             (t/is (false? (:has-media-trimmed (th/db-get :file {:id file-id})))
@@ -387,7 +387,7 @@
 
 (t/deftest file-gc-tx2-skips-when-file-deleted
   ;; White-box like the stale-revn test: delete the file after Tx1 and
-  ;; call gc-in-tx directly with the Tx1 snapshot. The light row lock
+  ;; call clean-file-in-tx directly with the Tx1 snapshot. The light row lock
   ;; sees the deleted row and Tx2 skips without writing.
   (let [profile (th/create-profile* 1)
         file    (th/create-file* 1 {:profile-id (:id profile)
@@ -397,7 +397,7 @@
     (let [repaired (#'file-gc/repair-and-persist th/*system* {:file-id file-id})]
       (t/is (some? repaired) "Tx1 reads and returns the file")
       (th/db-update! :file {:deleted-at (ct/now)} {:id file-id})
-      (let [result (#'file-gc/gc-in-tx th/*system* repaired)
+      (let [result (#'file-gc/clean-file-in-tx th/*system* repaired)
             row    (th/db-get :file {:id file-id} {::db/remove-deleted false})]
         (t/testing "Tx2 skips a file deleted after Tx1 without writing"
           (t/is (false? result))

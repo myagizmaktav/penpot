@@ -369,7 +369,7 @@
   [conn id]
   (:revn (db/exec-one! conn [sql:lock-file-revn id])))
 
-(defn- gc-file
+(defn- clean-file
   "Second transaction: take the row lock, check nobody modified the
   file since the first transaction, and run the garbage collection on
   its snapshot instead of re-reading it. Takes the file returned by
@@ -390,7 +390,7 @@
       (l/dbg :hint "skip cleaning, file changed since repair" :file-id (str id))
       false)))
 
-(defn- gc-in-tx
+(defn- clean-file-in-tx
   "Second transaction: run the garbage collection on the snapshot
   returned by the first transaction. Everything expensive (loading the
   files that use this one as a library) happens outside any write
@@ -405,7 +405,7 @@
                   (let [cfg (-> cfg
                                 (update ::sto/storage sto/configure conn)
                                 (assoc ::timestamp (ct/now)))]
-                    (gc-file cfg used-remote deleted-components file))))))
+                    (clean-file cfg used-remote deleted-components file))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; HANDLER
@@ -430,7 +430,7 @@
                            nil))
             processed? (when repaired
                          (try
-                           (gc-in-tx base-cfg repaired)
+                           (clean-file-in-tx base-cfg repaired)
                            (catch Throwable cause
                              (l/err :hint "error on cleaning file"
                                     :file-id (str (:file-id props))
