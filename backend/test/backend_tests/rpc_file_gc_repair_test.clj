@@ -70,6 +70,13 @@
               (fn [cfg]
                 (bfc/update-file! cfg file))))
 
+(defn- repair-file!
+  "Run the Tx1 phase the way the scheduler-fed task does: props always
+  carry the current revn, so the freshness check has a baseline."
+  [file-id]
+  (#'file-gc/repair-and-persist th/*system* {:file-id file-id
+                                             :revn (:revn (th/db-get :file {:id file-id}))}))
+
 (defn- corrupt-shape-types
   "Mirrors production files where the decoder left unconverted types:
   shape `:type` as text, ids as text and object/page-map keys as
@@ -225,7 +232,7 @@
     ;; open (it used to hold a db/plan cursor while loading every
     ;; user file, tripping idle-in-transaction timeouts in prod).
     (t/testing "file-gc cleans a library used by several files"
-      (t/is (true? (th/run-task! :file-gc {:file-id (:id library)})))
+      (t/is (true? (th/run-file-gc! (:id library))))
       (let [components (get-in (read-file (:id library)) [:data :components])]
         (t/is (contains? components (:component-id used))
               "component still used by library users is preserved")
@@ -253,7 +260,7 @@
     ;; The file reads fine (no migration pending) but must fail at
     ;; clean-media validation until the repair is implemented.
     (t/testing "file-gc repairs schema-invalid types and completes"
-      (t/is (true? (th/run-task! :file-gc {:file-id file-id})))
+      (t/is (true? (th/run-file-gc! file-id)))
       (t/is (true? (:has-media-trimmed (th/db-get :file {:id file-id})))))))
 
 (t/deftest file-gc-repairs-nil-pages-that-fail-at-migration
@@ -276,7 +283,7 @@
     ;; succeeds where it used to throw invalid file data.
 
     (t/testing "file-gc repairs nil pages and completes"
-      (t/is (true? (th/run-task! :file-gc {:file-id file-id})))
+      (t/is (true? (th/run-file-gc! file-id)))
       (t/is (true? (:has-media-trimmed (th/db-get :file {:id file-id})))))))
 
 (defn- corrupt-with-unknown-type
@@ -303,7 +310,7 @@
         (update :data corrupt-shape-types)
         (persist-file))
 
-    (let [repaired (#'file-gc/repair-and-persist th/*system* {:file-id file-id})]
+    (let [repaired (repair-file! file-id)]
       (t/is (some? repaired) "Tx1 reads and returns the snapshot")
       (t/testing "Tx1 persists nothing without repair"
         ;; Stored keys keep the corrupted forms (strings in
@@ -343,7 +350,7 @@
           _ (add-watch l/log-record ::capture
                        (fn [_ _ _ record] (swap! records conj record)))]
       (try
-        (let [result (th/run-task! :file-gc {:file-id file-id})
+        (let [result (th/run-file-gc! file-id)
               ;; Keep the watch installed while waiting: log emission
               ;; is asynchronous, removing it right after run-task!
               ;; would drop the record before it arrives.
@@ -397,7 +404,7 @@
         (update :data #(corrupt-with-broken-child % page-id))
         (persist-file))
 
-    (let [repaired (#'file-gc/repair-and-persist th/*system* {:file-id file-id})]
+    (let [repaired (repair-file! file-id)]
       (t/is (some? repaired) "Tx1 repairs and returns the file")
       (let [revn-after-tx1 (:revn repaired)]
         ;; Concurrent write after Tx1: bump revn through the real RPC path.
@@ -426,7 +433,7 @@
                                     :project-id (:default-project-id profile)
                                     :is-shared false})
         file-id (setup-file-with-rect profile file)]
-    (let [repaired (#'file-gc/repair-and-persist th/*system* {:file-id file-id})]
+    (let [repaired (repair-file! file-id)]
       (t/is (some? repaired) "Tx1 reads and returns the file")
       (th/db-update! :file {:deleted-at (ct/now)} {:id file-id})
       (let [result (#'file-gc/clean-file-in-tx th/*system* repaired)
@@ -456,7 +463,7 @@
         (update :data #(corrupt-with-broken-child % page-id))
         (persist-file))
 
-    (let [repaired (#'file-gc/repair-and-persist th/*system* {:file-id file-id})]
+    (let [repaired (repair-file! file-id)]
       (t/is (some? repaired) "Tx1 repairs and returns the file")
       (let [revn-after-tx1 (:revn (th/db-get :file {:id file-id}))]
         (t/is (> revn-after-tx1 (:revn file))
@@ -478,7 +485,7 @@
           ;; Tx1 commit from before is still the base: revn never goes
           ;; backwards and nothing is rolled back across transactions.
           (t/testing "a later Tx2 failure keeps the Tx1 commit"
-            (t/is (nil? (th/run-task! :file-gc {:file-id file-id})))
+            (t/is (nil? (th/run-file-gc! file-id)))
             (t/is (false? (:has-media-trimmed (th/db-get :file {:id file-id})))
                   "the file is not marked as trimmed")
             (t/is (= revn-corrupted (:revn (th/db-get :file {:id file-id})))

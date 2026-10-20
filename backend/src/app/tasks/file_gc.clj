@@ -283,7 +283,10 @@
                     (fmg/migrate-file libs))]
       ;; We should ensure that the scheduled file and the procesing file
       ;; has not changed since schedule, for this reason we check the
-      ;; revn from props with the revn from retrieved file from database
+      ;; revn from props with the revn from retrieved file from database.
+      ;; TODO(2.20): drop the nil-revn tolerance once task props always
+      ;; carry revn (enforced upstream in develop); every caller already
+      ;; passes it through run-file-gc!/repair-file!.
       (when (or (nil? (:revn props)) (= (:revn props) (:revn clean)))
         clean))))
 
