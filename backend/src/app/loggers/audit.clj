@@ -248,6 +248,10 @@
     ;; pending per enabled consumer. A rollback takes both on its way
     ;; out, so a row never outlives its queue.
     (consumer/queue-pendings cfg [(:id row)])
+    ;; The storage-usage consumer only queues its own pending for the
+    ;; events that can change per-team media storage. The shadow rows of
+    ;; telemetry mode share the id shape and never reach this consumer.
+    (consumer/queue-storage-usage-pendings cfg [(:id row)] [(:name params)] [(:source params)])
     row))
 
 (def ^:private xf:filter-telemetry-props

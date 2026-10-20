@@ -40,10 +40,12 @@
 ;; previous owner's queue.
 (def consumer-nexus 1)
 (def consumer-admin-console 2)
+(def consumer-storage-usage 3)
 
 (def ^:private consumers
   [{:id consumer-nexus          :flag :nexus         :label "nexus"}
-   {:id consumer-admin-console :flag :admin-console :label "admin-console"}])
+   {:id consumer-admin-console :flag :admin-console :label "admin-console"}
+   {:id consumer-storage-usage :flag :storage-usage :label "storage-usage"}])
 
 (def ^:private xf:enabled-consumers
   "Static transducer: keep the consumers whose send flag is on.
@@ -63,9 +65,10 @@
   nothing to queue or no consumer is on. One multi-row statement for
   all ids instead of one per consumer: this runs inside every audited
   RPC and the bulk frontend ingest. Runs inside the row transaction:
-  a rollback takes both."
+  a rollback takes both. The storage-usage consumer is excluded: its
+  pendings are queued selectively by queue-storage-usage-pendings."
   [cfg ids]
-  (let [consumers (enabled-consumers)]
+  (let [consumers (remove #(= % consumer-storage-usage) (enabled-consumers))]
     (when (and (seq ids) (seq consumers))
       (db/insert-many! cfg :audit-log-pending
                        [:audit-log-id :consumer]
@@ -73,6 +76,49 @@
                              consumer consumers]
                          [id consumer])
                        {::sql/on-conflict-do-nothing true}))))
+
+(def storage-usage-event-names
+  "Audit event names that can change per-team media storage. Only these
+  queue a pending for the storage-usage consumer; everything else skips
+  it, so unrelated traffic pays no extra row and the drain stays lean."
+  #{"upload-file-media-object"
+    "create-file-media-object-from-url"
+    "clone-file-media-object"
+    "assemble-file-media-object"
+    "create-file"
+    "create-font-variant"
+    "delete-font"
+    "delete-font-variant"
+    "delete-file"
+    "delete-object-with-cascade"
+    "hard-delete-objects"
+    "permanently-delete-team-files"
+    "restore-deleted-team-files"
+    "file-gc"})
+
+(defn queue-storage-usage-pendings
+  "Queue the storage-usage pending only for events in
+  `storage-usage-event-names`. Takes ids with their names and sources
+  in order; telemetry shadows are skipped (the full row already
+  queues). Does nothing when the flag is off or no name matches. Runs
+  inside the row transaction like `queue-pendings`."
+  [cfg ids names sources]
+  (when (contains? cf/flags :storage-usage)
+    (let [pairs (into []
+                      (comp (filter (fn [[_ name source]]
+                                      ;; Telemetry shadows are skipped:
+                                      ;; the full row already queues.
+                                      (and (contains? storage-usage-event-names name)
+                                           (not (contains? #{"telemetry:backend"
+                                                             "telemetry:frontend"}
+                                                           (str source))))))
+                            (map (fn [[id _ _]] [id consumer-storage-usage])))
+                      (map vector ids names sources))]
+      (when (seq pairs)
+        (db/insert-many! cfg :audit-log-pending
+                         [:audit-log-id :consumer]
+                         pairs
+                         {::sql/on-conflict-do-nothing true})))))
 
 (def ^:private consumer-labels
   (into {} (map (juxt :id :label)) consumers))
@@ -420,6 +466,87 @@
       (complete-batch cfg consumer-admin-console rows)
       admin-console-res)))
 
+(def ^:private sql:team-ids-by-files
+  "SELECT p.team_id AS team_id
+     FROM file AS f
+     JOIN project AS p ON (p.id = f.project_id)
+    WHERE f.id = ANY(?::uuid[])")
+
+(def ^:private sql:team-ids-by-projects
+  "SELECT team_id
+     FROM project
+    WHERE id = ANY(?::uuid[])")
+
+(def ^:private sql:mark-storage-usage-dirty
+  "INSERT INTO team_storage_usage AS tsu (team_id, dirty_at)
+   SELECT id, now() FROM unnest(?::uuid[]) AS u(id)
+   ON CONFLICT (team_id) DO UPDATE
+      SET dirty_at = EXCLUDED.dirty_at
+    WHERE tsu.dirty_at IS NULL")
+
+(defn- collect-storage-usage-team-ids
+  "Team ids whose media storage may have changed in this chunk. Reads
+  :team-id straight from props when present, otherwise resolves the
+  file and project ids (cascade events carry them nested) with two
+  batched lookups. Unresolvable rows are skipped with a warning: the
+  next event marks the team again, and the recompute job sweeps the
+  teams that were never computed."
+  [{:keys [::db/conn]} events]
+  (let [maps     (filter some? (mapcat (fn [{:keys [props]}] [props (:cascade props)]) events))
+        direct   (into #{} (comp (mapcat (fn [m] (concat (some-> (:team-id m) vector)
+                                                         (:team-ids m))))
+                                 (keep uuid/coerce))
+                       maps)
+        file-ids (into #{} (comp (mapcat (fn [m] (concat (some-> (:file-id m) vector)
+                                                         (:file-ids m)
+                                                         (:files m))))
+                                 (keep uuid/coerce))
+                       maps)
+        proj-ids (into #{} (comp (mapcat (fn [m] (concat (some-> (:project-id m) vector)
+                                                         (:project-ids m))))
+                                 (keep uuid/coerce))
+                       maps)
+        by-file  (if (seq file-ids)
+                   (into #{} (map :team-id)
+                         (db/exec! conn [sql:team-ids-by-files
+                                         (db/create-array conn "uuid" file-ids)]))
+                   #{})
+        by-proj  (if (seq proj-ids)
+                   (into #{} (map :team-id)
+                         (db/exec! conn [sql:team-ids-by-projects
+                                         (db/create-array conn "uuid" proj-ids)]))
+                   #{})]
+    (into direct (concat by-file by-proj))))
+
+(defn- mark-storage-usage-dirty
+  [conn team-ids]
+  (when (seq team-ids)
+    ;; Keeps the oldest dirty mark: a team marked twice in one window
+    ;; is recomputed once.
+    (db/exec-one! conn [sql:mark-storage-usage-dirty
+                        (db/create-array conn "uuid" team-ids)])))
+
+(defn- consumer-storage-usage-chunk
+  "Mark dirty the teams changed in one pending chunk and complete it.
+  Returns {:sent :skipped} like the other chunk fns: relevant events
+  count as sent, anything else (defense in depth, the queue is
+  selective) as skipped. Takes a transactional cfg, no metrics here:
+  same contract as the other chunk fns."
+  [cfg]
+  (db/exec! cfg ["SET LOCAL lock_timeout = '30s'"])
+  (when-let [rows (get-pending-rows cfg consumer-storage-usage)]
+    (let [events   (mapv row->event (mapv decode-row rows))
+          relevant (filterv #(contains? storage-usage-event-names (:name %)) events)
+          skipped  (- (count events) (count relevant))
+          teams    (collect-storage-usage-team-ids cfg relevant)
+          _        (mark-storage-usage-dirty (::db/conn cfg) teams)]
+      (l/trc :hint "consumer events chunk"
+             :consumer "storage-usage"
+             :events (count relevant)
+             :teams (count teams))
+      (complete-batch cfg consumer-storage-usage rows)
+      {:sent (count relevant) :skipped skipped})))
+
 (defn- drain-consumer
   "Drain one consumer queue chunk by chunk, one transaction per chunk.
   Returns totals; a chunk the destination refuses (or that throws)
@@ -494,6 +621,7 @@
 
 (declare execute-audit-log-consumer-nexus)
 (declare execute-audit-log-consumer-admin-console)
+(declare execute-audit-log-consumer-storage-usage)
 
 (def schema:audit-log-consumer-nexus-params
   "Overrides for the nexus job repl invocation defaults.
@@ -554,6 +682,29 @@
      (execute-audit-log-consumer-admin-console cfg params))
    ::jobs/decoder   (sm/decoder schema:audit-log-consumer-admin-console-params sm/json-transformer)
    ::jobs/validator (sm/validator schema:audit-log-consumer-admin-console-params)})
+
+(def schema:audit-log-consumer-storage-usage-params
+  "Params of the storage-usage job: none. Cron submits {}; system deps
+  (pool) live on the job-def cfg closed over by the handler, not in
+  job params. Closed on purpose, same as the admin-console schema."
+  [:map {:closed true}])
+
+(defmethod ig/assert-key ::storage-usage-job-def
+  [_ cfg]
+  (assert (db/pool? (::db/pool cfg)) "expected a valid database pool")
+  (assert (mtx/metrics? (::mtx/metrics cfg)) "expected a valid metrics instance"))
+
+(defmethod ig/init-key ::storage-usage-job-def
+  [_ cfg]
+  (l/dbg :hint "audit log consumer job initialized"
+         :consumer "storage-usage")
+  {::jobs/name      :audit-log-consumer-storage-usage
+   ::jobs/schema    schema:audit-log-consumer-storage-usage-params
+   ::jobs/handler
+   (fn [_context params]
+     (execute-audit-log-consumer-storage-usage cfg params))
+   ::jobs/decoder   (sm/decoder schema:audit-log-consumer-storage-usage-params sm/json-transformer)
+   ::jobs/validator (sm/validator schema:audit-log-consumer-storage-usage-params)})
 
 (defn- run-single-consumer
   "Drain one consumer queue, then housekeeping (reap disabled
@@ -631,9 +782,17 @@
 
 (defn execute-audit-log-consumer-admin-console
   "Admin-console job handler: drain the admin-console queue in chunks,
-  then clean up (heartbeat per iteration: the sent chunk batches can
-  be long)."
+  then clean up (heartbeat per iteration: the batches can be long)."
   [cfg _params]
   (if-not (contains? cf/flags :admin-console)
     (l/dbg :hint "audit log consumer (admin-console) skipped, flag off")
     (run-single-consumer cfg consumer-admin-console consumer-admin-console-chunk (ct/tpoint))))
+
+(defn execute-audit-log-consumer-storage-usage
+  "Storage-usage job handler: drain the storage-usage queue in chunks,
+  marking dirty the teams whose media storage may have changed
+  (heartbeat per iteration: a burst can span many chunks)."
+  [cfg _params]
+  (if-not (contains? cf/flags :storage-usage)
+    (l/dbg :hint "audit log consumer (storage-usage) skipped, flag off")
+    (run-single-consumer cfg consumer-storage-usage consumer-storage-usage-chunk (ct/tpoint))))

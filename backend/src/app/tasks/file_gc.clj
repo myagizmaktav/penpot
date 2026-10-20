@@ -26,6 +26,7 @@
    [app.features.fdata :as feat.fdata]
    [app.features.file-snapshots :as fsnap]
    [app.jobs :as jobs]
+   [app.loggers.audit :as audit]
    [app.storage :as sto]
    [integrant.core :as ig]))
 
@@ -63,6 +64,15 @@
       (l/trc :obj "media-object"
              :file-id (str id)
              :id (str id)))
+
+    ;; The storage-usage consumer learns about this shrink path only
+    ;; through this event: no RPC runs here. The team id is resolved
+    ;; from the file id on ingest.
+    (when (and (seq unused-media) (contains? cf/flags :audit-log))
+      (audit/submit cfg {:name "file-gc"
+                         :type "action"
+                         :props {:file-id id}
+                         :context {:triggered-by "cron-task"}}))
 
     file))
 

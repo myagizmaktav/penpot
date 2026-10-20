@@ -127,8 +127,12 @@
   (when (seq rows)
     (db/insert-many! tx :audit-log event-columns rows)
     ;; Same transaction as the rows: every ingested record is born
-    ;; pending for every enabled consumer (see consumer-task).
-    (consumer/queue-pendings tx (map first rows))))
+    ;; pending for every enabled consumer (see consumer-task). The
+    ;; storage-usage consumer only queues its own pending for the
+    ;; events that can change per-team media storage; the name and the
+    ;; source ride at indexes 1 and 2 of the row vector, next to the id.
+    (consumer/queue-pendings tx (map first rows))
+    (consumer/queue-storage-usage-pendings tx (map first rows) (map second rows) (map #(nth % 2) rows))))
 
 (defn- handle-events
   [{:keys [::db/pool] :as cfg} params]

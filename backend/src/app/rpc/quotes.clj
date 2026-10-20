@@ -607,16 +607,48 @@
      JOIN storage_object AS so ON (so.id = refs.so_id)
     WHERE so.deleted_at IS NULL")
 
+(defn get-live-media-storage-bytes
+  "Total live media storage bytes of a team, computed straight from
+  the domain tables. Slow on large teams (full scan); only the
+  background recompute job calls it, never the upload path."
+  [conn team-id]
+  (:total (db/exec-one! conn [sql:get-media-storage-bytes-per-team
+                              team-id team-id team-id team-id team-id team-id])))
+
+(def ^:private sql:ensure-team-storage-usage
+  "INSERT INTO team_storage_usage (team_id, dirty_at)
+   VALUES (?, now())
+   ON CONFLICT (team_id) DO NOTHING")
+
+(def ^:private sql:get-cached-media-storage-bytes-per-team
+  "SELECT COALESCE(total_bytes, 0) AS total
+     FROM team_storage_usage
+    WHERE team_id = ?")
+
 (defmethod check-quote ::media-storage-bytes-per-team
-  [{:keys [::profile-id ::team-id ::target] :as cfg}]
+  [{:keys [::db/conn ::profile-id ::team-id ::target] :as cfg}]
   (assert (valid-media-storage-bytes-per-team-quote? cfg) "invalid quote parameters")
-  (-> cfg
-      (assoc ::default (cf/get :quotes-media-storage-bytes-per-team
-                               (* 20 1024 1024 1024)))
-      (assoc ::quote-sql [sql:get-quotes-2 target team-id profile-id profile-id])
-      (assoc ::count-sql [sql:get-media-storage-bytes-per-team
-                          team-id team-id team-id team-id team-id team-id])
-      (generic-check!)))
+  (if (and (contains? cf/flags :storage-usage)
+           (contains? cf/flags :audit-log))
+    ;; Cached path: the background recompute job keeps the counter.
+    ;; Fail open: a team with no row yet is allowed through and marked
+    ;; dirty for the next recompute pass.
+    (do
+      (db/exec-one! conn [sql:ensure-team-storage-usage team-id])
+      (-> cfg
+          (assoc ::default (cf/get :quotes-media-storage-bytes-per-team
+                                   (* 20 1024 1024 1024)))
+          (assoc ::quote-sql [sql:get-quotes-2 target team-id profile-id profile-id])
+          (assoc ::count-sql [sql:get-cached-media-storage-bytes-per-team team-id])
+          (generic-check!)))
+    ;; Live path: full scan, only when the background counter is off.
+    (-> cfg
+        (assoc ::default (cf/get :quotes-media-storage-bytes-per-team
+                                 (* 20 1024 1024 1024)))
+        (assoc ::quote-sql [sql:get-quotes-2 target team-id profile-id profile-id])
+        (assoc ::count-sql [sql:get-media-storage-bytes-per-team
+                            team-id team-id team-id team-id team-id team-id])
+        (generic-check!))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; QUOTE: BINFILES JOBS PER PROFILE

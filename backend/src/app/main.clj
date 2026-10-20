@@ -628,6 +628,7 @@
     :run-webhook                    (ig/ref ::webhooks/run-webhook-job-def)
     :process-webhook-event          (ig/ref ::webhooks/process-webhook-event-job-def)
     :file-gc                        (ig/ref :app.tasks.file-gc/job-def)
+    :recompute-team-storage          (ig/ref :app.tasks.team-storage/job-def)
     :offload-file-data              (ig/ref :app.tasks.offload-file-data/job-def)
     :objects-gc                     (ig/ref :app.tasks.objects-gc/job-def)
     :export-binfile                 (ig/ref :app.tasks.export-binfile/job-def)
@@ -640,7 +641,8 @@
     :session-gc                     (ig/ref ::session/job-def)
     :file-gc-scheduler              (ig/ref :app.tasks.file-gc-scheduler/job-def)
     :audit-log-consumer-nexus        (ig/ref :app.loggers.audit.consumer-task/nexus-job-def)
-    :audit-log-consumer-admin-console (ig/ref :app.loggers.audit.consumer-task/admin-console-job-def)}
+    :audit-log-consumer-admin-console (ig/ref :app.loggers.audit.consumer-task/admin-console-job-def)
+    :audit-log-consumer-storage-usage (ig/ref :app.loggers.audit.consumer-task/storage-usage-job-def)}
 
    ::jobs/request-pool
    {::rds/client  (ig/ref ::rds/client)
@@ -672,6 +674,10 @@
    :app.tasks.file-gc/job-def
    {::db/pool     (ig/ref ::db/pool)
     ::sto/storage (ig/ref ::sto/storage)
+    ::mtx/metrics (ig/ref ::mtx/metrics)}
+
+   :app.tasks.team-storage/job-def
+   {::db/pool     (ig/ref ::db/pool)
     ::mtx/metrics (ig/ref ::mtx/metrics)}
 
    :app.tasks.offload-file-data/job-def
@@ -739,6 +745,10 @@
    {::db/pool            (ig/ref ::db/pool)
     :app.nitrate/client  (ig/ref :app.nitrate/client)
     ::mtx/metrics        (ig/ref ::mtx/metrics)}
+
+   :app.loggers.audit.consumer-task/storage-usage-job-def
+   {::db/pool     (ig/ref ::db/pool)
+    ::mtx/metrics (ig/ref ::mtx/metrics)}
 
    ::email/blacklist
    {}
@@ -865,7 +875,15 @@
 
      (when (contains? cf/flags :admin-console)
        {:cron #penpot/cron "30 */5 * * * ?" ;; every 5m, offset 30s from nexus
-        :job :audit-log-consumer-admin-console})]}
+        :job :audit-log-consumer-admin-console})
+
+     (when (contains? cf/flags :storage-usage)
+       {:cron #penpot/cron "15 */5 * * * ?" ;; every 5m, offset 15s
+        :job :audit-log-consumer-storage-usage})
+
+     (when (contains? cf/flags :storage-usage)
+       {:cron #penpot/cron "45 */5 * * * ?" ;; every 5m, after the drain
+        :job :recompute-team-storage})]}
 
    ::wrk/dispatcher
    {::rds/client  (ig/ref ::rds/client)
