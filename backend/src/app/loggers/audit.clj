@@ -433,28 +433,37 @@
      JOIN project AS p ON (p.id = f.project_id)
     WHERE f.id = ANY(?::uuid[])")
 
+(def ^:private xf:team-ids
+  "Transducer: pull the team id out of a team/project/file resolution
+  row. Allocated once so hot paths (every audited RPC) do not rebuild
+  it per call."
+  (map :team-id))
+
 (defn get-team-ids
   "Resolve a mixed bag of team, project and file ids to team ids with
   two batched lookups. Producers of cascade-style events call it so
-  consumers never join production tables. Takes any connectable: inside
-  a transaction it reuses the caller connection."
+  consumers never join production tables. The pure part runs without
+  touching the database; each lookup resolves its connection lazily,
+  only when it has ids (reusing the caller transaction)."
   [cfg {:keys [team-ids project-ids file-ids]}]
-  (db/run! cfg
-           (fn [{:keys [::db/conn]}]
-             (let [direct  (into #{} (keep uuid/coerce) team-ids)
-                   by-proj (if (seq project-ids)
-                             (into #{}
-                                   (map :team-id)
-                                   (db/exec! conn [sql:team-ids-by-projects
-                                                   (db/create-array conn "uuid" project-ids)]))
-                             #{})
-                   by-file (if (seq file-ids)
-                             (into #{}
-                                   (map :team-id)
-                                   (db/exec! conn [sql:team-ids-by-files
-                                                   (db/create-array conn "uuid" file-ids)]))
-                             #{})]
-               (into direct (concat by-proj by-file))))))
+  (let [direct (into #{} (keep uuid/coerce) team-ids)]
+    (-> direct
+        (into (if (seq project-ids)
+                (db/run! cfg
+                         (fn [{:keys [::db/conn]}]
+                           (into #{}
+                                 xf:team-ids
+                                 (db/plan conn [sql:team-ids-by-projects
+                                                (db/create-array conn "uuid" project-ids)]))))
+                #{}))
+        (into (if (seq file-ids)
+                (db/run! cfg
+                         (fn [{:keys [::db/conn]}]
+                           (into #{}
+                                 xf:team-ids
+                                 (db/plan conn [sql:team-ids-by-files
+                                                (db/create-array conn "uuid" file-ids)]))))
+                #{})))))
 
 (def ^:private read-event-names
   "Read commands excluded from team-id resolution on top of the `get-*`

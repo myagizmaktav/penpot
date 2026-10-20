@@ -7,6 +7,7 @@
 (ns app.tasks.delete-object
   "A generic task for object deletion cascade handling"
   (:require
+   [app.common.data :as d]
    [app.common.logging :as l]
    [app.common.schema :as sm]
    [app.common.time :as ct]
@@ -20,6 +21,13 @@
    [integrant.core :as ig]))
 
 (def ^:dynamic *team-deletion* false)
+
+(def ^:dynamic *deleting-file-ids*
+  "Ids of the files the running cascade is going to delete. Bound by
+  the `:project` method with its own files so `:file` only absorbs the
+  dependents that survive: absorbing into files that die in the same
+  run is wasted work."
+  nil)
 
 (def ^:dynamic *cascade*
   "Accumulates the ids marked deleted by the current cascade execution,
@@ -79,17 +87,33 @@
 
     (when (and (:is-shared file)
                (not *team-deletion*))
-      ;; NOTE: we don't prevent file deletion on absorb operation failure
-      (try
-        ;; Capture the dependents before removing the relations, then
-        ;; absorb them: the relations must still exist at this point.
-        (let [dependents (files/get-referenced-files conn id)]
-          (db/delete! conn :file-library-rel {:library-file-id id})
-          (db/tx-run! cfg files/absorb-library id :file-ids dependents))
-        (catch Throwable cause
-          (l/warn :hint "error on absorbing library"
-                  :file-id id
-                  :cause cause))))
+      ;; NOTE: we don't prevent file deletion on absorb operation failure.
+      ;; Only live dependents outside this cascade matter: if the whole
+      ;; closure dies together there is nothing to absorb and the
+      ;; relations die with their files (both FKs are ON DELETE CASCADE).
+      (let [doomed     (or *deleting-file-ids* #{})
+            dependents (into []
+                             (remove doomed)
+                             (files/get-referenced-files conn id))]
+        (when (seq dependents)
+          ;; Runs in the caller transaction: a nested transaction here
+          ;; would join it anyway, so the call goes directly. The
+          ;; savepoint contains an absorb failure: it rolls back the
+          ;; absorb and the relations removal and the cascade goes on;
+          ;; the next run retries from a coherent state.
+          (let [sp (db/savepoint conn "absorb-library")]
+            (try
+              ;; The relations must still exist at this point: removing
+              ;; them first is what lets a later hard delete proceed.
+              (db/delete! conn :file-library-rel {:library-file-id id})
+              (files/absorb-library cfg id :file-ids dependents)
+              (catch Throwable cause
+                (db/rollback! conn sp)
+                (l/warn :hint "error on absorbing library"
+                        :file-id id
+                        :cause cause))
+              (finally
+                (db/release! conn sp)))))))
 
     ;; Mark file change to be deleted, but only the rows that do not carry a
     ;; date yet. A revision is born already scheduled for deletion one hour
@@ -136,12 +160,16 @@
               {:id id}
               {::db/return-keys false})
 
-  (doseq [file (db/query conn :file
-                         {:project-id id}
-                         {::db/columns [:id :deleted-at]})]
-    (delete-object cfg (assoc file
-                              :object :file
-                              :deleted-at deleted-at)))
+  (let [files (db/query conn :file
+                        {:project-id id}
+                        {::db/columns [:id :deleted-at]})]
+    ;; Every file below dies in this run: absorbing a library into
+    ;; them is wasted work, so the files only absorb survivors.
+    (binding [*deleting-file-ids* (into #{} d/xf:map-id files)]
+      (doseq [file files]
+        (delete-object cfg (assoc file
+                                  :object :file
+                                  :deleted-at deleted-at)))))
 
   (record :projects id))
 
@@ -201,30 +229,28 @@
   params inside a single transaction, tracking the cascade and reporting
   it as an audit event when anything was marked."
   [cfg params]
-  (db/tx-run! cfg
-              (fn [cfg]
-                (when (top-exists? cfg params)
-                  (binding [*cascade* (atom {:teams [] :projects [] :files []})]
-                    (delete-object cfg params)
-                    (let [{:keys [teams projects files]} @*cascade*]
-                      (when (or (seq teams) (seq projects) (seq files))
-                        ;; Flat team ids for consumers that key on them
-                        ;; (the storage-usage drain), so they never join
-                        ;; production tables.
-                        (let [team-ids (audit/get-team-ids cfg
-                                                           {:team-ids teams
-                                                            :project-ids projects
-                                                            :file-ids files})]
-                          (audit/submit cfg {:name "delete-object-with-cascade"
-                                             :type "action"
-                                             :props {:object (:object params)
-                                                     :id (:id params)
-                                                     :deleted-at (:deleted-at params)
-                                                     :team-ids (vec team-ids)
-                                                     :cascade {:team-ids teams
-                                                               :project-ids projects
-                                                               :file-ids files}}
-                                             :context {:triggered-by "delete-object"}})))))))))
+  (when (top-exists? cfg params)
+    (binding [*cascade* (atom {:teams [] :projects [] :files []})]
+      (delete-object cfg params)
+      (let [{:keys [teams projects files]} @*cascade*]
+        (when (or (seq teams) (seq projects) (seq files))
+          ;; Flat team ids for consumers that key on them
+          ;; (the storage-usage drain), so they never join
+          ;; production tables.
+          (let [team-ids (audit/get-team-ids cfg
+                                             {:team-ids teams
+                                              :project-ids projects
+                                              :file-ids files})]
+            (audit/submit cfg {:name "delete-object-with-cascade"
+                               :type "action"
+                               :props {:object (:object params)
+                                       :id (:id params)
+                                       :deleted-at (:deleted-at params)
+                                       :team-ids (vec team-ids)
+                                       :cascade {:team-ids teams
+                                                 :project-ids projects
+                                                 :file-ids files}}
+                               :context {:triggered-by "delete-object"}})))))))
 
 (defmethod ig/assert-key ::job-def
   [_ params]
@@ -237,6 +263,6 @@
    ::jobs/schema    schema:delete-object-params
    ::jobs/handler
    (fn [_context params]
-     (execute-delete-object cfg params))
+     (db/tx-run! cfg execute-delete-object params))
    ::jobs/decoder   (sm/decoder schema:delete-object-params sm/json-transformer)
    ::jobs/validator (sm/validator schema:delete-object-params)})

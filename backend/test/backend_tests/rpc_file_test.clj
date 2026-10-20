@@ -2353,6 +2353,35 @@
     (t/is (= :delete-object (::jobs/name @submitted)))
     (t/is (not (contains? (::jobs/params @submitted) :file-ids)))))
 
+(t/deftest delete-project-skips-absorb-for-files-dying-together
+  ;; When the whole project dies, absorbing the shared library into
+  ;; its own dying files is wasted work: the cascade cleans the
+  ;; relations but leaves the dependents untouched.
+  (let [profile (th/create-profile* 1)
+        team-id (:default-team-id profile)
+        proj    (th/create-project* 1 {:profile-id (:id profile) :team-id team-id})
+        library (th/create-file* 1 {:profile-id (:id profile)
+                                    :project-id (:id proj)
+                                    :is-shared true})
+        file    (th/create-file* 2 {:profile-id (:id profile)
+                                    :project-id (:id proj)})
+        _       (th/link-file-to-library* {:file-id (:id file)
+                                           :library-id (:id library)})
+        revn    (:revn (th/db-get :file {:id (:id file)}))]
+    (let [out (th/command! {::th/type :delete-project
+                            ::rpc/profile-id (:id profile)
+                            :id (:id proj)})]
+      (t/is (nil? (:error out))))
+    (th/run-pending-jobs)
+    ;; Nothing outside the cascade uses the library, so the relations
+    ;; stay until the hard delete removes them with their files.
+    (t/is (not (empty? (th/db-query :file-library-rel {:library-file-id (:id library)}))))
+    (t/is (= revn (:revn (th/db-get :file {:id (:id file)} {::db/remove-deleted false}))))
+    ;; The hard delete cascades the relations away with their files.
+    (th/run-task! :objects-gc {:skip-delay true})
+    (t/is (nil? (th/db-get :file {:id (:id file)} {::db/remove-deleted false})))
+    (t/is (empty? (th/db-query :file-library-rel {:library-file-id (:id library)})))))
+
 (t/deftest unpublish-shared-library-absorbs-its-tokens-lib
   (let [profile (th/create-profile* 1)
         {:keys [library] :as prepared} (prepare-tokens-library profile)
