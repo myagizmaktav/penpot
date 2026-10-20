@@ -285,6 +285,39 @@
   [data page-id shape-id]
   (assoc-in data [:pages-index page-id :objects shape-id :type] "triangle"))
 
+(t/deftest file-gc-tx1-does-not-persist-without-repair
+  ;; White-box: Tx1 returns the sanitized snapshot but writes nothing
+  ;; when the repair loop finds no errors; only Tx2 persists.
+  (let [profile (th/create-profile* 1)
+        file    (th/create-file* 1 {:profile-id (:id profile)
+                                    :project-id (:default-project-id profile)
+                                    :is-shared false})
+        file-id (setup-file-with-rect profile file)
+        file    (read-file file-id)
+        page-id (first (:pages (:data file)))
+        shape-id (first (remove #{uuid/zero}
+                                (filter uuid? (keys (get-in file [:data :pages-index page-id :objects])))))]
+    (t/is (some? shape-id) "a non-root shape exists")
+
+    (-> (read-file file-id)
+        (update :data corrupt-shape-types)
+        (persist-file))
+
+    (let [repaired (#'file-gc/repair-and-persist th/*system* {:file-id file-id})]
+      (t/is (some? repaired) "Tx1 reads and returns the snapshot")
+      (t/testing "Tx1 persists nothing without repair"
+        ;; Stored keys keep the corrupted forms (strings in
+        ;; pages-index, keywords in objects): decode does not
+        ;; normalize them, sanitize does the value coercion.
+        (t/is (= "rect" (get-in (read-file file-id)
+                                [:data :pages-index (str page-id) :objects (keyword (str shape-id)) :type]))
+              "the stored data keeps the unconverted type")
+        (let [shapes (vals (get-in repaired [:data :pages-index page-id :objects]))
+              rect   (first (filter #(= "rect" (:name %)) shapes))]
+          (t/is (some? rect) "the snapshot keeps the shape")
+          (t/is (= :rect (:type rect))
+                "the returned snapshot is sanitized"))))))
+
 (t/deftest file-gc-returns-false-for-unfixable-file-without-half-tx
   (let [profile (th/create-profile* 1)
         file    (th/create-file* 1 {:profile-id (:id profile)
@@ -294,7 +327,8 @@
         file    (read-file file-id)
         page-id (first (:pages (:data file)))
         shape-id (first (remove #{uuid/zero}
-                                (filter uuid? (keys (get-in file [:pages-index page-id :objects])))))]
+                                (filter uuid? (keys (get-in file [:data :pages-index page-id :objects])))))]
+    (t/is (some? shape-id) "a non-root shape exists")
 
     (-> (read-file file-id)
         (update :data #(corrupt-with-unknown-type % page-id shape-id))
@@ -415,7 +449,8 @@
         file    (read-file file-id)
         page-id (first (:pages (:data file)))
         shape-id (first (remove #{uuid/zero}
-                                (filter uuid? (keys (get-in file [:pages-index page-id :objects])))))]
+                                (filter uuid? (keys (get-in file [:data :pages-index page-id :objects])))))]
+    (t/is (some? shape-id) "a non-root shape exists")
 
     (-> (read-file file-id)
         (update :data #(corrupt-with-broken-child % page-id))

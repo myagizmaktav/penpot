@@ -269,7 +269,8 @@
 (defn- get-file
   "Reads the file holding the row lock without migrating, sanitizes
   first so legacy migrations do not choke on unconverted types, then
-  migrates and persists explicitly."
+  migrates in memory. Never writes: the second transaction persists
+  the snapshot."
   [cfg {:keys [file-id] :as props}]
   (when-let [file (bfc/get-file cfg file-id
                                 :realize? true
@@ -280,10 +281,6 @@
           clean (-> file
                     (update :data ctf/sanitize-file-data)
                     (fmg/migrate-file libs))]
-      ;; Persist only when sanitize or migration changed something: a
-      ;; clean file stays untouched, so preventive runs write nothing.
-      (when (not= file clean)
-        (bfc/update-file! cfg clean))
       ;; We should ensure that the scheduled file and the procesing file
       ;; has not changed since schedule, for this reason we check the
       ;; revn from props with the revn from retrieved file from database
