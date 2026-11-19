@@ -26,6 +26,8 @@ import { ApiDocs } from "./ApiDocs";
  */
 export interface SessionContext {
     userToken?: string;
+    pluginSessionId?: string;
+    signal?: AbortSignal;
 }
 
 /**
@@ -35,6 +37,7 @@ class StreamableSession {
     constructor(
         public readonly transport: StreamableHTTPServerTransport,
         public readonly userToken: string | undefined,
+        public readonly pluginSessionId: string | undefined,
         public lastActiveTime: number
     ) {}
 }
@@ -138,7 +141,7 @@ export class PenpotMcpServer {
     private readonly streamableTransports: Record<string, StreamableSession> = {};
     private readonly sseTransports: Record<
         string,
-        { transport: SSEServerTransport; userToken?: string; lastActiveTime: number }
+        { transport: SSEServerTransport; userToken?: string; pluginSessionId?: string; lastActiveTime: number }
     > = {};
 
     public readonly host: string;
@@ -308,7 +311,11 @@ export class PenpotMcpServer {
         );
 
         for (const tool of this.tools) {
-            server.registerTool(tool.name, tool.config, async (args: any) => tool.instance.execute(args));
+            server.registerTool(tool.name, tool.config, async (args: any, extra: { signal: AbortSignal }) =>
+                this.sessionContext.run({ ...this.getSessionContext(), signal: extra.signal }, () =>
+                    tool.instance.execute(args)
+                )
+            );
         }
 
         return server;
@@ -357,6 +364,15 @@ export class PenpotMcpServer {
          */
         this.app.all("/mcp", async (req: any, res: any) => {
             const sessionId = req.headers["mcp-session-id"] as string | undefined;
+            const requestedPluginSession = req.query.pluginSessionId;
+            if (
+                requestedPluginSession !== undefined &&
+                (typeof requestedPluginSession !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(requestedPluginSession))
+            ) {
+                res.status(400).send("Invalid pluginSessionId");
+                return;
+            }
+            let pluginSessionId: string | undefined = requestedPluginSession;
             let userToken: string | undefined = undefined;
             let transport: StreamableHTTPServerTransport;
 
@@ -364,8 +380,16 @@ export class PenpotMcpServer {
             if (sessionId && this.streamableTransports[sessionId]) {
                 // existing session: reuse stored transport and token
                 const session = this.streamableTransports[sessionId];
+                if (
+                    (req.query.userToken !== undefined && req.query.userToken !== session.userToken) ||
+                    (requestedPluginSession !== undefined && requestedPluginSession !== session.pluginSessionId)
+                ) {
+                    res.status(403).send("MCP session owner or plugin selector mismatch");
+                    return;
+                }
                 transport = session.transport;
                 userToken = session.userToken;
+                pluginSessionId = session.pluginSessionId;
                 session.lastActiveTime = Date.now();
                 this.logger.info(
                     `Received request for existing session with id=${sessionId}; userTokenFp=${PenpotMcpServer.tokenFingerprint(session.userToken)}`
@@ -389,7 +413,12 @@ export class PenpotMcpServer {
                     // For an adopted session, reuse the existing ID; otherwise generate a new one.
                     sessionIdGenerator: () => (isAdoptedSession ? sessionId! : randomUUID()),
                     onsessioninitialized: (id) => {
-                        this.streamableTransports[id] = new StreamableSession(transport, userToken, Date.now());
+                        this.streamableTransports[id] = new StreamableSession(
+                            transport,
+                            userToken,
+                            pluginSessionId,
+                            Date.now()
+                        );
                         this.logger.info(
                             `Session initialized with id=${id} for userTokenFp=${PenpotMcpServer.tokenFingerprint(userToken)}; total sessions: ${Object.keys(this.streamableTransports).length}`
                         );
@@ -408,7 +437,12 @@ export class PenpotMcpServer {
                     const inner = (transport as any)._webStandardTransport;
                     inner._initialized = true;
                     inner.sessionId = sessionId;
-                    this.streamableTransports[sessionId!] = new StreamableSession(transport, userToken, Date.now());
+                    this.streamableTransports[sessionId!] = new StreamableSession(
+                        transport,
+                        userToken,
+                        pluginSessionId,
+                        Date.now()
+                    );
                 }
 
                 transport.onclose = () => {
@@ -423,7 +457,7 @@ export class PenpotMcpServer {
             }
 
             // handle the request
-            await this.sessionContext.run({ userToken }, async () => {
+            await this.sessionContext.run({ userToken, pluginSessionId }, async () => {
                 await transport.handleRequest(req, res, req.body);
             });
         });
@@ -433,10 +467,23 @@ export class PenpotMcpServer {
          */
         this.app.get("/sse", async (req: any, res: any) => {
             const userToken = req.query.userToken as string | undefined;
+            const pluginSessionId = req.query.pluginSessionId;
+            if (
+                pluginSessionId !== undefined &&
+                (typeof pluginSessionId !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(pluginSessionId))
+            ) {
+                res.status(400).send("Invalid pluginSessionId");
+                return;
+            }
 
-            await this.sessionContext.run({ userToken }, async () => {
+            await this.sessionContext.run({ userToken, pluginSessionId }, async () => {
                 const transport = new SSEServerTransport("/messages", res);
-                this.sseTransports[transport.sessionId] = { transport, userToken, lastActiveTime: Date.now() };
+                this.sseTransports[transport.sessionId] = {
+                    transport,
+                    userToken,
+                    pluginSessionId,
+                    lastActiveTime: Date.now(),
+                };
 
                 const server = this.createMcpServer();
                 await server.connect(transport);
@@ -456,9 +503,12 @@ export class PenpotMcpServer {
 
             if (session) {
                 session.lastActiveTime = Date.now();
-                await this.sessionContext.run({ userToken: session.userToken }, async () => {
-                    await session.transport.handlePostMessage(req, res, req.body);
-                });
+                await this.sessionContext.run(
+                    { userToken: session.userToken, pluginSessionId: session.pluginSessionId },
+                    async () => {
+                        await session.transport.handlePostMessage(req, res, req.body);
+                    }
+                );
             } else {
                 res.status(400).send("No transport found for sessionId");
             }

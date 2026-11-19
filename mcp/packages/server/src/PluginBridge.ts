@@ -6,6 +6,7 @@ import { PluginTaskRequest, PluginTaskResponse, PluginTaskResult } from "@penpot
 import { createLogger } from "./logger";
 import type { PenpotMcpServer } from "./PenpotMcpServer";
 import type { RedisBridge } from "./RedisBridge";
+import { ExecuteCodePluginTask } from "./tasks/ExecuteCodePluginTask";
 
 const KEEP_ALIVE_TIME = 30000; // 30 seconds
 
@@ -30,7 +31,28 @@ export interface PluginLivenessState {
 interface ClientConnection extends PluginLivenessState {
     socket: WebSocket;
     userToken: string | null;
+    pluginSessionId: string;
     pingInterval: NodeJS.Timeout;
+    queue: string[];
+    activeTaskId?: string;
+    blocked: boolean;
+    probeId?: string;
+    probeTimeout?: NodeJS.Timeout;
+}
+
+/** Reads a bounded positive integer; invalid limits must not silently disable admission. */
+function positiveLimit(name: string, fallback: number): number {
+    const raw = process.env[name];
+    if (raw === undefined) return fallback;
+    if (!/^[1-9][0-9]*$/.test(raw) || !Number.isSafeInteger(Number(raw)) || Number(raw) > 10000) {
+        throw new Error(`${name} must be an integer between 1 and 10000`);
+    }
+    return Number(raw);
+}
+
+/** Keeps the legacy Redis channel unchanged while separating named plugin sessions. */
+function routingKey(userToken: string, pluginSessionId: string): string {
+    return pluginSessionId ? JSON.stringify([userToken, pluginSessionId]) : userToken;
 }
 
 /**
@@ -75,6 +97,13 @@ export class PluginBridge {
     private readonly clientsByToken: Map<string, ClientConnection> = new Map();
     private readonly pendingTasks: Map<string, AbstractPluginTask<any, any>> = new Map();
     private readonly taskTimeouts: Map<string, NodeJS.Timeout> = new Map();
+    private readonly taskConnections: Map<string, ClientConnection> = new Map();
+    private readonly taskAbortCleanup: Map<string, () => void> = new Map();
+    private readonly maxConnections = positiveLimit("PENPOT_MCP_MAX_PLUGIN_CONNECTIONS_PER_USER", 1);
+    private readonly maxPending = positiveLimit("PENPOT_MCP_MAX_PENDING_TASKS_PER_PLUGIN", 30);
+    private readonly queueTimeoutSecs = positiveLimit("PENPOT_MCP_QUEUE_TIMEOUT_S", 120);
+    private readonly probeTimeoutSecs = positiveLimit("PENPOT_MCP_LIVENESS_PROBE_TIMEOUT_S", 5);
+    private closing = false;
 
     /**
      * Creates the plugin bridge and starts its WebSocket server.
@@ -109,11 +138,39 @@ export class PluginBridge {
             // extract userToken from query parameters
             const url = new URL(request.url!, `ws://${request.headers.host}`);
             const userToken = url.searchParams.get("userToken");
+            const pluginSessionId = url.searchParams.get("pluginSessionId") ?? "";
+            if (pluginSessionId && !/^[a-zA-Z0-9_-]{1,128}$/.test(pluginSessionId)) {
+                ws.close(1008, "Invalid pluginSessionId");
+                return;
+            }
 
             // require userToken if running in multi-user mode
             if (this.mcpServer.isMultiUserMode() && !userToken) {
                 this.logger.warn("Connection attempt without userToken in multi-user mode - rejecting");
                 ws.close(1008, "Missing userToken parameter");
+                return;
+            }
+
+            // a reloaded or crashed editor can leave an idle registration behind until its socket times out;
+            // release it so the editor's new connection is not refused, but never one that holds work
+            const now = Date.now();
+            let ownerConnections = [...this.connectedClients.values()].filter((c) => c.userToken === userToken);
+            const conflicting =
+                ownerConnections.find((c) => c.pluginSessionId === pluginSessionId) ??
+                (ownerConnections.length >= this.maxConnections
+                    ? ownerConnections.find((c) => this.isAbandoned(c, now))
+                    : undefined);
+            if (conflicting && this.isAbandoned(conflicting, now)) {
+                this.logger.info("Releasing an abandoned idle plugin connection for a new connection");
+                this.removeConnection(conflicting.socket);
+                conflicting.socket.terminate();
+                ownerConnections = ownerConnections.filter((c) => c !== conflicting);
+            }
+            if (
+                ownerConnections.length >= this.maxConnections ||
+                ownerConnections.some((c) => c.pluginSessionId === pluginSessionId)
+            ) {
+                ws.close(1008, "Plugin connection limit or duplicate pluginSessionId; existing connections retained");
                 return;
             }
 
@@ -132,41 +189,46 @@ export class PluginBridge {
             const connection: ClientConnection = {
                 socket: ws,
                 userToken,
+                pluginSessionId,
                 pingInterval,
                 lastHeartbeat: Date.now(),
                 frozen: false,
+                queue: [],
+                blocked: false,
             };
             this.connectedClients.set(ws, connection);
             if (userToken) {
                 // ensure only one connection per userToken
-                if (this.clientsByToken.has(userToken)) {
+                const key = routingKey(userToken, pluginSessionId);
+                if (this.clientsByToken.has(key)) {
                     this.logger.warn("Duplicate connection for given user token; rejecting new connection");
                     this.removeConnection(ws);
                     ws.close(1008, "Duplicate connection for given user token; close previous connection first.");
                     return;
                 }
 
-                this.clientsByToken.set(userToken, connection);
+                this.clientsByToken.set(key, connection);
 
                 // In multi-instance mode, subscribe to this token's Redis request channel so
                 // that task requests issued by other instances are dispatched to this plugin.
                 if (this.redisBridge) {
-                    const tokenForSubscription = userToken;
+                    const tokenForSubscription = key;
                     this.redisBridge
-                        .subscribeToTasks(userToken, (request) =>
-                            this.dispatchForwardedTask(tokenForSubscription, request)
-                        )
+                        .subscribeToTasks(key, (request) => this.dispatchForwardedTask(tokenForSubscription, request))
                         .catch((error) => this.logger.error(error, "Failed to subscribe to Redis task channel"));
                 }
             }
 
             ws.on("message", (data: Buffer) => {
-                this.logger.debug("Received WebSocket message: %s", data.toString());
+                const text = data.toString();
+                if (this.logger.isLevelEnabled("debug")) {
+                    this.logger.debug("Received WebSocket message: %s", text);
+                }
                 try {
                     // any plugin message proves the page event loop is running
                     connection.lastHeartbeat = Date.now();
 
-                    const message = JSON.parse(data.toString());
+                    const message = JSON.parse(text);
                     if (message?.type === "freeze") {
                         connection.frozen = true;
                         this.logger.info("Plugin tab reported it is being frozen by the browser");
@@ -176,7 +238,19 @@ export class PluginBridge {
                     if (message?.type === "heartbeat") {
                         return;
                     }
-                    this.handlePluginTaskResponse(message as PluginTaskResponse<any>);
+                    if (connection.probeId && message?.id === connection.probeId) {
+                        clearTimeout(connection.probeTimeout);
+                        connection.probeId = undefined;
+                        connection.probeTimeout = undefined;
+                        if (message.success === true) {
+                            this.dispatchNext(connection);
+                        } else {
+                            this.removeConnection(ws);
+                            ws.close(1011, "Plugin liveness probe failed");
+                        }
+                        return;
+                    }
+                    this.handlePluginTaskResponse(message as PluginTaskResponse<any>, connection);
                 } catch (error) {
                     this.logger.error(error, "Failure while processing WebSocket message");
                 }
@@ -212,18 +286,34 @@ export class PluginBridge {
             return;
         }
         clearInterval(connection.pingInterval);
+        clearTimeout(connection.probeTimeout);
+        connection.probeId = undefined;
+        connection.blocked = true;
         this.connectedClients.delete(ws);
+        for (const [id, target] of this.taskConnections) {
+            if (target === connection) {
+                this.rejectPendingTask(
+                    id,
+                    new Error(
+                        id === connection.activeTaskId
+                            ? "Plugin disconnected; task outcome may be unknown. Reconcile saved state before retrying."
+                            : "Plugin disconnected; queued task was not dispatched."
+                    )
+                );
+            }
+        }
         if (connection.userToken) {
+            const key = routingKey(connection.userToken, connection.pluginSessionId);
             // Perform the token-keyed cleanup only if this connection owns the token registration.
             // A connection rejected as a duplicate carries the same token but must not remove token associations.
-            if (this.clientsByToken.get(connection.userToken) !== connection) {
+            if (this.clientsByToken.get(key) !== connection) {
                 this.logger.debug("Removed connection does not own its token registration; skipping token cleanup");
             } else {
-                this.clientsByToken.delete(connection.userToken);
+                this.clientsByToken.delete(key);
 
                 if (this.redisBridge) {
                     this.redisBridge
-                        .unsubscribeFromTasks(connection.userToken)
+                        .unsubscribeFromTasks(key)
                         .catch((error) => this.logger.error(error, "Failed to unsubscribe from Redis task channel"));
                 }
             }
@@ -238,7 +328,12 @@ export class PluginBridge {
      *
      * @param response - The plugin task response containing ID and result
      */
-    private handlePluginTaskResponse(response: PluginTaskResponse<any>): void {
+    private handlePluginTaskResponse(response: PluginTaskResponse<any>, source?: ClientConnection): void {
+        // A task ID alone does not confer permission to settle another plugin's work.
+        if (source && (this.taskConnections.get(response.id) !== source || source.activeTaskId !== response.id)) {
+            this.logger.warn("Ignoring response from a plugin that does not own the active task");
+            return;
+        }
         const task = this.pendingTasks.get(response.id);
         if (!task) {
             this.logger.info(`Received response for unknown task ID: ${response.id}`);
@@ -252,6 +347,7 @@ export class PluginBridge {
             this.taskTimeouts.delete(response.id);
         }
         this.pendingTasks.delete(response.id);
+        this.releaseConnectionTask(response.id);
 
         // Resolve or reject the task's promise based on the result
         if (response.success) {
@@ -287,6 +383,7 @@ export class PluginBridge {
             this.taskTimeouts.delete(taskId);
         }
         this.pendingTasks.delete(taskId);
+        this.releaseConnectionTask(taskId);
 
         pendingTask.rejectWithError(error);
         this.logger.info(`Task ${taskId} rejected: ${error.message}`);
@@ -309,13 +406,21 @@ export class PluginBridge {
                 throw new Error("No userToken found in session context. Multi-user mode requires authentication.");
             }
 
-            const connection = this.clientsByToken.get(sessionContext.userToken);
+            const connection = this.clientsByToken.get(
+                routingKey(sessionContext.userToken, sessionContext.pluginSessionId ?? "")
+            );
             if (!connection) {
                 throw new Error(PluginBridge.MULTIUSER_CONNECTION_ERROR_MESSAGE);
             }
 
             return connection;
         } else {
+            const selected = this.mcpServer.getSessionContext()?.pluginSessionId;
+            if (selected) {
+                const matches = [...this.connectedClients.values()].filter((c) => c.pluginSessionId === selected);
+                if (matches.length !== 1) throw new Error("No unique Penpot plugin for pluginSessionId");
+                return matches[0];
+            }
             // single-user mode: return the single connected client
             if (this.connectedClients.size === 0) {
                 throw new Error(
@@ -372,6 +477,7 @@ export class PluginBridge {
      * @throws Error if a local dispatch is required but no suitable connection is available
      */
     private sendPluginTask(task: AbstractPluginTask<any, any>, useRedis: boolean, connection?: ClientConnection): void {
+        if (this.closing) throw new Error("Plugin bridge is shutting down; task was not dispatched");
         let onTimeout: (() => void) | undefined;
 
         if (useRedis) {
@@ -379,7 +485,7 @@ export class PluginBridge {
             if (!sessionContext?.userToken) {
                 throw new Error("No userToken found in session context. Multi-user mode requires authentication.");
             }
-            const userToken = sessionContext.userToken;
+            const userToken = routingKey(sessionContext.userToken, sessionContext.pluginSessionId ?? "");
             const redisBridge = this.redisBridge!;
             this.logger.debug("Dispatching task %s via Redis", task.id);
 
@@ -402,17 +508,47 @@ export class PluginBridge {
             onTimeout = () => void redisBridge.unsubscribeFromResponse(task.id);
         } else {
             const target = connection ?? this.getClientConnection();
+            const signal = this.mcpServer.getSessionContext()?.signal;
+            if (signal?.aborted) throw new Error("MCP request cancelled; task was not dispatched");
             if (target.socket.readyState !== 1) {
                 // WebSocket is not open
                 throw new Error(`Plugin instance is disconnected. Task could not be sent.`);
             }
 
             // the socket can be open while browser-throttled plugin JS cannot run tasks
-            assertPluginResponsive(target, Date.now());
-
-            // register the task for result correlation, then send over the socket
+            // Explicit browser freeze is authoritative. Idle plugin timers may
+            // be delayed; dispatchNext checks the JavaScript event loop first.
+            if (target.frozen) assertPluginResponsive(target, Date.now());
+            if (target.blocked) throw new Error("Plugin requires reconnection; task was not dispatched");
+            if (target.queue.length + (target.activeTaskId ? 1 : 0) >= this.maxPending) {
+                throw new Error("Plugin task queue is full; task was not dispatched");
+            }
             this.pendingTasks.set(task.id, task);
-            target.socket.send(JSON.stringify(task.toRequest()));
+            this.taskConnections.set(task.id, target);
+            target.queue.push(task.id);
+            this.taskTimeouts.set(
+                task.id,
+                setTimeout(() => {
+                    this.rejectPendingTask(task.id, new Error("Plugin queue wait timed out; task was not dispatched"));
+                }, this.queueTimeoutSecs * 1000)
+            );
+            if (signal) {
+                const cancelQueued = () => {
+                    // A caller cannot stop code already executing in the plugin.
+                    // Keep that editor occupied until its response or timeout.
+                    if (target.activeTaskId !== task.id) {
+                        this.rejectPendingTask(
+                            task.id,
+                            new Error("MCP request cancelled; queued task was not dispatched")
+                        );
+                    }
+                };
+                this.taskAbortCleanup.set(task.id, () => signal.removeEventListener("abort", cancelQueued));
+                signal.addEventListener("abort", cancelQueued, { once: true });
+                if (signal.aborted) cancelQueued();
+            }
+            this.dispatchNext(target);
+            return;
         }
 
         // Set up a timeout to reject the task if no response is received
@@ -429,6 +565,95 @@ export class PluginBridge {
 
         this.taskTimeouts.set(task.id, timeoutHandle);
         this.logger.info(`Sent task ${task.id}`);
+    }
+
+    /**
+     * Whether a connection holds no work and its socket is closed or has been silent for longer than the heartbeat
+     * threshold, so that releasing it cannot leave the outcome of any task unknown.
+     */
+    private isAbandoned(connection: ClientConnection, now: number): boolean {
+        if (connection.activeTaskId || connection.queue.length > 0 || connection.probeId) {
+            return false;
+        }
+        return (
+            connection.socket.readyState !== WebSocket.OPEN ||
+            now - connection.lastHeartbeat > HEARTBEAT_STALE_THRESHOLD_MS
+        );
+    }
+
+    /** Releases a task's lane and schedules the next task only while the connection is healthy. */
+    private releaseConnectionTask(id: string): void {
+        this.taskAbortCleanup.get(id)?.();
+        this.taskAbortCleanup.delete(id);
+        const target = this.taskConnections.get(id);
+        if (!target) return;
+        this.taskConnections.delete(id);
+        target.queue = target.queue.filter((queued) => queued !== id);
+        if (target.activeTaskId === id) target.activeTaskId = undefined;
+        queueMicrotask(() => this.dispatchNext(target));
+    }
+
+    /** Runs one task at a time on an editor; different editors have independent lanes. */
+    private dispatchNext(target: ClientConnection): void {
+        if (this.closing || target.blocked || target.activeTaskId || target.probeId || !target.queue.length) return;
+        const id = target.queue[0];
+        const task = this.pendingTasks.get(id);
+        if (!task) {
+            // a settled task must not block the lane
+            target.queue.shift();
+            this.dispatchNext(target);
+            return;
+        }
+        try {
+            if (target.socket.readyState !== WebSocket.OPEN) throw new Error("Plugin disconnected");
+            if (target.frozen) assertPluginResponsive(target, Date.now());
+        } catch (error) {
+            target.blocked = true;
+            this.removeConnection(target.socket);
+            target.socket.close(1011, "Plugin is not responsive");
+            return;
+        }
+        if (Date.now() - target.lastHeartbeat > HEARTBEAT_STALE_THRESHOLD_MS) {
+            // Check the plugin's JavaScript event loop with a read-only no-op.
+            // A protocol pong alone does not prove that browser JavaScript runs.
+            // Keep all requested operations queued until this exact socket replies.
+            const probe = new ExecuteCodePluginTask({ code: "return null;" });
+            target.probeId = probe.id;
+            target.probeTimeout = setTimeout(() => {
+                this.removeConnection(target.socket);
+                target.socket.close(1011, "Plugin liveness probe timed out");
+            }, this.probeTimeoutSecs * 1000);
+            target.socket.send(JSON.stringify(probe.toRequest()), (error) => {
+                if (error) {
+                    this.removeConnection(target.socket);
+                    target.socket.terminate();
+                }
+            });
+            return;
+        }
+        target.queue.shift();
+        target.activeTaskId = id;
+        clearTimeout(this.taskTimeouts.get(id));
+        this.taskTimeouts.set(
+            id,
+            setTimeout(() => {
+                target.blocked = true;
+                this.rejectPendingTask(
+                    id,
+                    new Error(
+                        "Plugin execution timed out; task outcome may be unknown. Reconcile saved state before retrying."
+                    )
+                );
+                this.removeConnection(target.socket);
+                target.socket.close(1011, "Task timed out; reconnect required");
+            }, this.taskTimeoutSecs * 1000)
+        );
+        target.socket.send(JSON.stringify(task.toRequest()), (error) => {
+            if (error) {
+                this.removeConnection(target.socket);
+                target.socket.terminate();
+            }
+        });
     }
 
     /**
@@ -472,6 +697,7 @@ export class PluginBridge {
      * Closes the WebSocket server and all connected client sockets.
      */
     public async close(): Promise<void> {
+        this.closing = true;
         for (const id of this.pendingTasks.keys()) {
             this.rejectPendingTask(id, new Error("Plugin bridge is shutting down; task outcome may be unknown"));
         }
