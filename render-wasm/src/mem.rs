@@ -35,13 +35,38 @@ pub extern "C" fn read_error_code() -> u8 {
     unsafe { BUFFER_ERROR }
 }
 
+/// Drops a transfer buffer that was allocated but never consumed.
+///
+/// `BUFFERU8` is a single-slot hand-off area between JS and WASM: JS allocates
+/// it, writes into it and immediately calls the consumer, which takes it; or
+/// WASM fills it and JS reads it and calls `free_bytes`. If the host throws
+/// between those two steps (for example writing through a heap view that was
+/// detached by a memory growth) the slot stays occupied. Because WASM runs
+/// single-threaded and every hand-off is synchronous, an occupied slot at the
+/// start of a new hand-off can only be an abandoned one, so it is safe to drop
+/// it. Treating it as a fatal error used to abort the whole module (the panic
+/// happens inside an `extern "C"` function, which cannot unwind).
+///
+/// Returns the size of the discarded buffer, if any.
+pub fn discard_stale_buffer(context: &str) -> Option<usize> {
+    unsafe {
+        #[allow(static_mut_refs)]
+        let stale = BUFFERU8.take();
+        stale.map(|buffer| {
+            println!(
+                "Warning: {}: discarding an unconsumed transfer buffer of {} bytes",
+                context,
+                buffer.len()
+            );
+            buffer.len()
+        })
+    }
+}
+
 pub fn write_bytes(mut bytes: Vec<u8>) -> *mut u8 {
     unsafe {
         performance::begin_measure!("write_bytes");
-        #[allow(static_mut_refs)]
-        if BUFFERU8.is_some() {
-            panic!("Bytes already allocated");
-        }
+        discard_stale_buffer("write_bytes");
 
         let ptr = bytes.as_mut_ptr();
         BUFFERU8 = Some(bytes);

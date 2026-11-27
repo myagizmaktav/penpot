@@ -155,8 +155,8 @@ pub extern "C" fn set_shape_stroke_sides(top: f32, right: f32, bottom: f32, left
 
 #[no_mangle]
 pub extern "C" fn add_shape_stroke_fill() {
+    let bytes = mem::bytes();
     with_current_shape_mut!(state, |shape: &mut Shape| {
-        let bytes = mem::bytes();
         let raw_fill = super::fills::RawFillData::try_from(&bytes[..]).expect("Invalid fill data");
         shape
             .set_stroke_fill(raw_fill.into())

@@ -100,8 +100,11 @@ pub fn read_fills_from_bytes(buffer: &[u8], num_fills: usize) -> Vec<shapes::Fil
 #[no_mangle]
 #[wasm_error]
 pub extern "C" fn set_shape_fills() -> Result<()> {
+    // Take the transfer buffer before looking up the current shape so it is
+    // consumed even when there is no current shape (otherwise it leaks and the
+    // next `alloc_bytes` finds the slot still occupied).
+    let bytes = mem::bytes();
     with_current_shape_mut!(state, |shape: &mut Shape| {
-        let bytes = mem::bytes();
         // The first byte contains the actual number of fills
         let num_fills = bytes.first().copied().unwrap_or(0) as usize;
         // Skip the first 4 bytes (header with fill count) and parse only the actual fills
@@ -114,8 +117,8 @@ pub extern "C" fn set_shape_fills() -> Result<()> {
 
 #[no_mangle]
 pub extern "C" fn add_shape_fill() {
+    let bytes = mem::bytes();
     with_current_shape_mut!(state, |shape: &mut Shape| {
-        let bytes = mem::bytes();
         let raw_fill = RawFillData::try_from(&bytes[..]).expect("Invalid fill data");
         shape.add_fill(raw_fill.into());
     });

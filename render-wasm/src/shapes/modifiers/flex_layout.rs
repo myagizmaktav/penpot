@@ -370,7 +370,9 @@ fn distribute_fill_across_space(layout_axis: &LayoutAxis, tracks: &mut [TrackDat
                 if !layout_axis.is_auto_across {
                     size = f32::min(size, layout_axis.across_space());
                 }
-                child.across_size = size;
+                // When the paddings are larger than the container the available
+                // space is negative; never hand a negative/zero size to a child.
+                child.across_size = size.max(MIN_SIZE);
             }
         }
     }
