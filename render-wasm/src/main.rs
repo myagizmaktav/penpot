@@ -555,8 +555,8 @@ pub extern "C" fn evict_images_to_budget(max_bytes: u32) -> Result<u32> {
 #[no_mangle]
 #[wasm_error]
 pub extern "C" fn set_shape_svg_raw_content() -> Result<()> {
+    let bytes = mem::bytes();
     with_current_shape_mut!(state, |shape: &mut Shape| {
-        let bytes = mem::bytes();
         let svg_raw_content = String::from_utf8(bytes)
             .map_err(|e| Error::RecoverableError(e.to_string()))?
             .trim_end_matches('\0')

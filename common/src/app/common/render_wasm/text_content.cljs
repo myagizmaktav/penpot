@@ -190,12 +190,21 @@
         text-buffer   (encode-text text)
         text-size     (mem/size text-buffer)
         total-size    (+ 4 metadata-size text-size)
+        offset        (mem/alloc total-size)
+        ;; The heap views must be taken *after* `alloc`: the allocation can grow
+        ;; the WASM memory, which detaches the previous ArrayBuffer and makes any
+        ;; earlier view throw (DataView) or silently drop writes (typed arrays).
         heapu8        (mem/get-heap-u8)
-        dview         (mem/get-data-view)
-        offset        (mem/alloc total-size)]
-    (-> offset
-        (mem/write-u32 dview num-spans)
-        (write-paragraph dview paragraph)
-        (write-spans dview spans paragraph normalize-font-id)
-        (mem/write-buffer heapu8 text-buffer))
+        dview         (mem/get-data-view)]
+    (try
+      (-> offset
+          (mem/write-u32 dview num-spans)
+          (write-paragraph dview paragraph)
+          (write-spans dview spans paragraph normalize-font-id)
+          (mem/write-buffer heapu8 text-buffer))
+      (catch :default cause
+        ;; Never leave the WASM transfer buffer allocated: the next
+        ;; `_alloc_bytes` would fail with "Bytes already allocated".
+        (mem/free)
+        (throw cause)))
     (h/call wasm/internal-module "_set_shape_text_content")))

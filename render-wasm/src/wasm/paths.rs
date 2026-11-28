@@ -209,8 +209,8 @@ pub extern "C" fn set_shape_path_buffer() -> Result<()> {
 
 #[no_mangle]
 pub extern "C" fn set_shape_path_content() {
+    let bytes = mem::bytes();
     with_current_shape_mut!(state, |shape: &mut Shape| {
-        let bytes = mem::bytes();
         let segments = bytes
             .chunks(size_of::<RawSegmentData>())
             .map(|chunk| RawSegmentData::try_from(chunk).expect("Invalid path data"))

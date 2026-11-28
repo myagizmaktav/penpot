@@ -378,9 +378,9 @@
              (wasm/ready?))
     (let [encoder (js/TextEncoder.)
           buf (.encode encoder text)
-          heapu8 (mem/get-heap-u8)
           size (mem/size buf)
-          offset (mem/alloc size)]
+          offset (mem/alloc size)
+          heapu8 (mem/get-heap-u8)]
       (mem/write-buffer offset heapu8 buf))))
 
 (defn text-editor-encode-text-post

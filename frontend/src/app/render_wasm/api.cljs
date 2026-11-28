@@ -858,9 +858,9 @@
   (let [children (into [] (filter uuid?) children)]
     (if (empty? children)
       (h/call wasm/internal-module "_set_children_0")
-      (let [heap   (mem/get-heap-u32)
-            size   (mem/get-alloc-size children UUID-U8-SIZE)
-            offset (mem/alloc->offset-32 size)]
+      (let [size   (mem/get-alloc-size children UUID-U8-SIZE)
+            offset (mem/alloc->offset-32 size)
+            heap   (mem/get-heap-u32)]
         (reduce
          (fn [offset id]
            (mem.h32/write-uuid offset heap id))
@@ -2060,8 +2060,8 @@
   [entries]
   (when (and (initialized?) (not ^boolean (empty? entries)))
     (let [size   (mem/get-alloc-size entries UUID-U8-SIZE)
-          heap   (mem/get-heap-u32)
-          offset (mem/alloc->offset-32 size)]
+          offset (mem/alloc->offset-32 size)
+          heap   (mem/get-heap-u32)]
 
       (reduce (fn [offset id]
                 (mem.h32/write-uuid offset heap id))
@@ -2084,8 +2084,8 @@
   (when (and (initialized?) (seq shape-ids))
     (let [ids    (vec shape-ids)
           size   (mem/get-alloc-size ids UUID-U8-SIZE)
-          heap   (mem/get-heap-u32)
-          offset (mem/alloc->offset-32 size)]
+          offset (mem/alloc->offset-32 size)
+          heap   (mem/get-heap-u32)]
       (reduce (fn [offset id]
                 (mem.h32/write-uuid offset heap id))
               offset
@@ -2143,10 +2143,10 @@
   [entries snap-pixel? snap-ignore-axis]
   (if-not (and (initialized?) (not ^boolean (empty? entries)))
     []
-    (let [heapf32 (mem/get-heap-f32)
-          heapu32 (mem/get-heap-u32)
-          size    (mem/get-alloc-size entries INPUT-MODIFIER-U8-SIZE)
-          offset  (mem/alloc->offset-32 size)]
+    (let [size    (mem/get-alloc-size entries INPUT-MODIFIER-U8-SIZE)
+          offset  (mem/alloc->offset-32 size)
+          heapf32 (mem/get-heap-f32)
+          heapu32 (mem/get-heap-u32)]
 
       (reduce (fn [offset [id data]]
                 (let [transform (:transform data)
@@ -2161,6 +2161,9 @@
       (let [precision  (pixel-precision-mode snap-pixel? snap-ignore-axis)
             offset     (-> (h/call wasm/internal-module "_propagate_modifiers" precision)
                            (mem/->offset-32))
+            ;; The result buffer is allocated by WASM, so re-read the views.
+            heapf32    (mem/get-heap-f32)
+            heapu32    (mem/get-heap-u32)
             length     (aget heapu32 offset)
             max-offset (+ offset 1 (* length MODIFIER-U32-SIZE))
             result     (loop [result (transient [])
@@ -2180,17 +2183,18 @@
   (when (and (initialized?) (not ^boolean (empty? entries)))
     (let [size    (mem/get-alloc-size entries UUID-U8-SIZE)
           offset  (mem/alloc->offset-32 size)
-          heapu32 (mem/get-heap-u32)
-          heapf32 (mem/get-heap-f32)]
+          heapu32 (mem/get-heap-u32)]
 
       (reduce (fn [offset id]
                 (mem.h32/write-uuid offset heapu32 id))
               offset
               entries)
 
-      (let [offset (-> (h/call wasm/internal-module "_get_selection_rect")
-                       (mem/->offset-32))
-            result (dr/read-selection-rect heapf32 offset)]
+      (let [offset  (-> (h/call wasm/internal-module "_get_selection_rect")
+                        (mem/->offset-32))
+            ;; Read through a fresh view: the result is allocated by WASM.
+            heapf32 (mem/get-heap-f32)
+            result  (dr/read-selection-rect heapf32 offset)]
         (mem/free)
         result))))
 
@@ -2759,8 +2763,8 @@
 (defn calculate-bool*
   [bool-type ids]
   (let [size   (mem/get-alloc-size ids UUID-U8-SIZE)
-        heap   (mem/get-heap-u32)
-        offset (mem/alloc->offset-32 size)]
+        offset (mem/alloc->offset-32 size)
+        heap   (mem/get-heap-u32)]
 
     (reduce (fn [offset id]
               (mem.h32/write-uuid offset heap id))
@@ -2772,6 +2776,7 @@
             (-> (h/call wasm/internal-module "_calculate_bool" (sr/translate-bool-type bool-type))
                 (mem/->offset-32))
 
+            heap    (mem/get-heap-u32)
             length  (aget heap offset)
             data    (mem/slice heap
                                (+ offset 1)
@@ -2827,10 +2832,12 @@
   [shape]
   (when (initialized?)
     (wselect/use-shape (:id shape))
-    (let [heapf32 (mem/get-heap-f32)
-          heapu32 (mem/get-heap-u32)
-          offset (-> (h/call wasm/internal-module "_calculate_position_data")
+    (let [offset (-> (h/call wasm/internal-module "_calculate_position_data")
                      (mem/->offset-32))
+          ;; Views are taken after the call: the result buffer is allocated by
+          ;; WASM and may have grown (and detached) the memory.
+          heapf32 (mem/get-heap-f32)
+          heapu32 (mem/get-heap-u32)
           length (aget heapu32 offset)
 
           max-offset (+ offset 1 (* length POSITION-DATA-U32-SIZE))
